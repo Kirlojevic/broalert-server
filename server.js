@@ -20,31 +20,37 @@ const STATIONS = [
   { id: '740000789', name: 'Tårnby',           country: 'DK' }
 ];
 
-async function fetchDepartures(stopId) {
-  const url = 'https://api.resrobot.se/v2.1/departureBoard?id=' + stopId + '&maxJourneys=15&format=json&accessId=' + RESROBOT;
-  const r = await fetch(url);
-  return await r.json();
-}
-
 app.get('/api/stations', (req, res) => res.json(STATIONS));
 
-app.get('/api/departures', async (req, res) => {
+// Main endpoint: trip planning between FROM and TO
+app.get('/api/trip', async (req, res) => {
   try {
-    const stopId = req.query.id;
-    if (!stopId) return res.status(400).json({ error: 'station id required' });
-    res.json(await fetchDepartures(stopId));
+    const fromId = req.query.from;
+    const toId = req.query.to;
+    if (!fromId || !toId) return res.status(400).json({ error: 'from and to required' });
+
+    const url = 'https://api.resrobot.se/v2.1/trip' +
+      '?originId=' + fromId +
+      '&destId=' + toId +
+      '&format=json' +
+      '&numF=6' +
+      '&accessId=' + RESROBOT;
+
+    const r = await fetch(url);
+    res.json(await r.json());
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.get('/api/stops', async (req, res) => {
-  const q = req.query.q;
-  if (!q) return res.status(400).json({ error: 'query required' });
+// Kept for diagnostics: raw departures from a single station
+app.get('/api/departures', async (req, res) => {
   try {
-    const url = 'https://api.resrobot.se/v2.1/location.name?input=' + encodeURIComponent(q) + '&maxNo=10&format=json&accessId=' + RESROBOT;
-    const r = await fetch(url);
-    res.json(await r.json());
+    const stopId = req.query.id;
+    if (!stopId) return res.status(400).json({ error: 'station id required' });
+    const url = 'https://api.resrobot.se/v2.1/departureBoard?id=' + stopId + '&maxJourneys=12&format=json&accessId=' + RESROBOT;
+    const rr = await fetch(url);
+    res.json(await rr.json());
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -86,21 +92,35 @@ const HTML = `<!DOCTYPE html>
   .section-label { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin: 6px 0 8px; display: flex; justify-content: space-between; align-items: center; }
   .badge { font-size: 9px; background: rgba(31,214,122,0.15); color: #1fd67a; padding: 3px 8px; border-radius: 20px; letter-spacing: 0.5px; border: 0.5px solid rgba(31,214,122,0.25); }
 
-  .dep-list { background: #1a1a1d; border-radius: 12px; overflow: hidden; border: 0.5px solid rgba(255,255,255,0.08); }
-  .dep-row { padding: 14px 16px; border-bottom: 0.5px solid rgba(255,255,255,0.06); display: flex; justify-content: space-between; align-items: center; gap: 10px; }
-  .dep-row:last-child { border-bottom: none; }
-  .dep-info { min-width: 0; flex: 1; }
-  .dep-line { font-weight: 600; font-size: 15px; }
-  .dep-dest { font-size: 12px; color: #888; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .dep-status { font-size: 11px; font-weight: 500; margin-top: 6px; display: flex; align-items: center; gap: 5px; }
-  .dep-status .sdot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
-  .dep-status.on-time { color: #1fd67a; }
-  .dep-status.delayed { color: #ffb344; }
-  .dep-status.cancelled { color: #ff4d4d; }
-  .dep-time { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; flex-shrink: 0; text-align: right; }
-  .dep-time.delayed { color: #ffb344; }
-  .dep-time.cancelled { color: #ff4d4d; text-decoration: line-through; }
-  .dep-time .orig { font-size: 11px; font-weight: 400; color: #666; text-decoration: line-through; margin-right: 5px; }
+  .trip-list { display: flex; flex-direction: column; gap: 10px; }
+  .trip-card { background: #1a1a1d; border-radius: 14px; padding: 14px 16px; border: 0.5px solid rgba(255,255,255,0.08); }
+  .trip-card.cancelled { border-color: rgba(255,77,77,0.4); background: rgba(255,77,77,0.04); }
+  .trip-card.delayed { border-color: rgba(255,179,68,0.3); }
+
+  .trip-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+  .trip-times { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .trip-times .arrow { color: #555; margin: 0 6px; }
+  .trip-times.cancelled { color: #ff4d4d; text-decoration: line-through; }
+  .trip-times.delayed { color: #ffb344; }
+  .trip-times .orig { font-size: 12px; color: #666; text-decoration: line-through; margin-right: 4px; font-weight: 400; }
+  .trip-duration { font-size: 12px; color: #888; font-variant-numeric: tabular-nums; }
+
+  .trip-meta { font-size: 12px; color: #aaa; margin-bottom: 8px; }
+  .trip-meta .lines { color: #f0f0f0; font-weight: 500; }
+
+  .trip-status { font-size: 12px; font-weight: 500; display: flex; align-items: center; gap: 6px; }
+  .trip-status .sdot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+  .trip-status.on-time { color: #1fd67a; }
+  .trip-status.delayed { color: #ffb344; }
+  .trip-status.cancelled { color: #ff4d4d; }
+
+  .trip-legs { margin-top: 10px; padding-top: 10px; border-top: 0.5px solid rgba(255,255,255,0.06); display: flex; flex-direction: column; gap: 6px; }
+  .leg-row { font-size: 11px; color: #888; display: flex; gap: 6px; align-items: baseline; }
+  .leg-row .leg-time { color: #ccc; font-variant-numeric: tabular-nums; min-width: 38px; }
+  .leg-row .leg-dot { color: #1fd67a; }
+  .leg-row.cancelled .leg-time { color: #ff4d4d; text-decoration: line-through; }
+  .leg-row.cancelled .leg-dot { color: #ff4d4d; }
+
   .empty, .loading { padding: 28px 16px; text-align: center; color: #666; font-size: 13px; }
   .err-box { background: rgba(255,77,77,0.08); border: 0.5px solid rgba(255,77,77,0.3); border-radius: 12px; padding: 16px; color: #ff8080; font-size: 13px; line-height: 1.5; }
   .info-note { background: rgba(255,179,68,0.08); border: 0.5px solid rgba(255,179,68,0.3); border-radius: 12px; padding: 12px 14px; color: #ffb344; font-size: 12px; line-height: 1.4; margin-bottom: 14px; }
@@ -147,19 +167,19 @@ const HTML = `<!DOCTYPE html>
   </div>
 
   <div id="info-note" class="info-note" style="display:none">
-    Danish station departures are limited until the Rejseplanen API is connected. Swedish stations show full live data.
+    Danish station routing is limited until the Rejseplanen API is connected.
   </div>
 
   <div class="section-label">
-    <span>Live departures from <span id="dep-source">Hyllie</span></span>
+    <span>Next journeys <span id="route-summary">Hyllie → København H</span></span>
     <span class="badge">TRAFIKLAB</span>
   </div>
 
-  <div id="dep-container" class="dep-list">
-    <div class="loading">Loading live departures…</div>
+  <div id="trip-container" class="trip-list">
+    <div class="loading">Loading next journeys…</div>
   </div>
 
-  <button class="refresh" onclick="loadDepartures()">Refresh</button>
+  <button class="refresh" onclick="loadTrips()">Refresh</button>
 
   <div id="picker-bg" class="modal-bg" onclick="closePickerIfBg(event)">
     <div class="modal" onclick="event.stopPropagation()">
@@ -194,8 +214,9 @@ const HTML = `<!DOCTYPE html>
     document.getElementById('to-name').textContent = state.to.name;
     document.getElementById('from-flag').textContent = state.from.country;
     document.getElementById('to-flag').textContent = state.to.country;
-    document.getElementById('dep-source').textContent = state.from.name;
-    document.getElementById('info-note').style.display = (state.from.country === 'DK') ? 'block' : 'none';
+    document.getElementById('route-summary').textContent = state.from.name + ' → ' + state.to.name;
+    var hasDanish = state.from.country === 'DK' || state.to.country === 'DK';
+    document.getElementById('info-note').style.display = hasDanish ? 'block' : 'none';
   }
 
   async function loadStations() {
@@ -238,7 +259,7 @@ const HTML = `<!DOCTYPE html>
     saveRoute();
     renderRoute();
     closePicker();
-    if (pickerTarget === 'from') loadDepartures();
+    loadTrips();
   }
 
   function swapStations() {
@@ -247,13 +268,10 @@ const HTML = `<!DOCTYPE html>
     state.to = tmp;
     saveRoute();
     renderRoute();
-    loadDepartures();
+    loadTrips();
   }
 
-  function fmtTime(t) {
-    if (!t) return '--:--';
-    return t.substring(0, 5);
-  }
+  function fmtTime(t) { return t ? t.substring(0, 5) : '--:--'; }
 
   function parseToMin(t) {
     if (!t) return 0;
@@ -265,86 +283,154 @@ const HTML = `<!DOCTYPE html>
     var s = parseToMin(scheduled);
     var a = parseToMin(actual);
     var diff = a - s;
-    if (diff < -720) diff += 24 * 60; // midnight rollover
+    if (diff < -720) diff += 24 * 60;
     return diff;
+  }
+
+  function parseDurationISO(iso) {
+    // PT1H22M or PT22M
+    if (!iso) return '';
+    var m = iso.match(/PT(?:(\\d+)H)?(?:(\\d+)M)?/);
+    if (!m) return '';
+    var h = parseInt(m[1] || '0', 10);
+    var min = parseInt(m[2] || '0', 10);
+    if (h === 0) return min + ' min';
+    return h + ' h ' + min + ' min';
   }
 
   function setStatus(ok, text) {
     var pill = document.getElementById('status-pill');
-    var txt = document.getElementById('status-text');
     pill.className = 'status-pill ' + (ok ? 'ok' : 'err');
-    txt.textContent = text;
+    document.getElementById('status-text').textContent = text;
   }
 
-  async function loadDepartures() {
-    var container = document.getElementById('dep-container');
-    container.innerHTML = '<div class="loading">Loading live departures…</div>';
+  async function loadTrips() {
+    var container = document.getElementById('trip-container');
+    container.innerHTML = '<div class="loading">Loading next journeys…</div>';
     try {
-      var res = await fetch('/api/departures?id=' + state.from.id);
+      var url = '/api/trip?from=' + encodeURIComponent(state.from.id) + '&to=' + encodeURIComponent(state.to.id);
+      var res = await fetch(url);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       var data = await res.json();
 
       if (data.error) throw new Error(data.error);
       if (data.errorCode) throw new Error(data.errorText || data.errorCode);
 
-      var deps = data.Departure || [];
-      if (deps.length === 0) {
-        var msg = state.from.country === 'DK'
-          ? 'No departures returned. Danish stations need the Rejseplanen API (coming soon).'
-          : 'No upcoming departures.';
-        container.innerHTML = '<div class="empty">' + msg + '</div>';
+      var trips = data.Trip || [];
+      if (trips.length === 0) {
+        container.innerHTML = '<div class="empty">No journeys found between these stations right now.</div>';
         setStatus(true, 'No data');
         return;
       }
 
       var html = '';
-      for (var i = 0; i < deps.length; i++) {
-        var d = deps[i];
-        var cancelled = d.cancelled === true || d.Cancelled === 'true';
-        var line = (d.ProductAtStop && d.ProductAtStop.displayNumber) || d.transportNumber || d.name || '';
-        var dest = d.direction || d.directionFlag || '';
-        var time = fmtTime(d.time);
-        var rtTime = d.rtTime ? fmtTime(d.rtTime) : null;
-        var delay = (rtTime && rtTime !== time) ? delayMin(time, rtTime) : 0;
-        var isDelayed = !cancelled && delay > 0;
+      var cancelledCount = 0, delayedCount = 0;
 
-        // Status label + class
+      for (var i = 0; i < trips.length; i++) {
+        var trip = trips[i];
+        var legs = (trip.LegList && trip.LegList.Leg) || [];
+        if (!Array.isArray(legs)) legs = [legs];
+
+        var transportLegs = legs.filter(function(l) { return l.type !== 'WALK'; });
+        if (transportLegs.length === 0) continue;
+
+        var firstLeg = transportLegs[0];
+        var lastLeg = transportLegs[transportLegs.length - 1];
+
+        var origin = firstLeg.Origin || {};
+        var dest = lastLeg.Destination || {};
+
+        var depTime = fmtTime(origin.time);
+        var depRt = origin.rtTime ? fmtTime(origin.rtTime) : null;
+        var arrTime = fmtTime(dest.time);
+        var arrRt = dest.rtTime ? fmtTime(dest.rtTime) : null;
+
+        var tripCancelled = legs.some(function(l) { return l.cancelled === true; });
+        var depDelay = (depRt && depRt !== depTime) ? delayMin(depTime, depRt) : 0;
+        var arrDelay = (arrRt && arrRt !== arrTime) ? delayMin(arrTime, arrRt) : 0;
+        var maxDelay = Math.max(depDelay, arrDelay);
+        var isDelayed = !tripCancelled && maxDelay > 0;
+
+        if (tripCancelled) cancelledCount++;
+        else if (isDelayed) delayedCount++;
+
+        // Lines (train names)
+        var lineNames = transportLegs.map(function(l) {
+          return (l.Product && (l.Product.displayNumber || l.Product.name)) || l.name || '';
+        }).filter(Boolean);
+        var linesText = lineNames.join(' → ');
+
+        var changes = transportLegs.length - 1;
+        var changesText = changes === 0 ? 'Direct' : (changes + ' change' + (changes > 1 ? 's' : ''));
+        var duration = parseDurationISO(trip.duration);
+
+        // Status badge
         var statusClass, statusText;
-        if (cancelled) {
+        if (tripCancelled) {
           statusClass = 'cancelled';
           statusText = 'Cancelled';
         } else if (isDelayed) {
           statusClass = 'delayed';
-          statusText = 'Delayed by ' + delay + ' min';
+          statusText = 'Delayed by ' + maxDelay + ' min';
         } else {
           statusClass = 'on-time';
           statusText = 'On time';
         }
 
-        // Time column
-        var timeClass = cancelled ? 'cancelled' : (isDelayed ? 'delayed' : '');
-        var timeHtml;
-        if (cancelled) {
-          timeHtml = time;
-        } else if (isDelayed) {
-          timeHtml = '<span class="orig">' + time + '</span>' + rtTime;
+        // Times display
+        var depDisplay, arrDisplay;
+        if (tripCancelled) {
+          depDisplay = depTime;
+          arrDisplay = arrTime;
         } else {
-          timeHtml = time;
+          depDisplay = (depRt && depRt !== depTime) ? '<span class="orig">' + depTime + '</span>' + depRt : depTime;
+          arrDisplay = (arrRt && arrRt !== arrTime) ? '<span class="orig">' + arrTime + '</span>' + arrRt : arrTime;
         }
 
-        html += '<div class="dep-row">' +
-                  '<div class="dep-info">' +
-                    '<div class="dep-line">' + escapeHtml(line) + '</div>' +
-                    '<div class="dep-dest">' + escapeHtml(dest) + '</div>' +
-                    '<div class="dep-status ' + statusClass + '"><span class="sdot"></span>' + statusText + '</div>' +
+        var cardClass = tripCancelled ? ' cancelled' : (isDelayed ? ' delayed' : '');
+        var timesClass = tripCancelled ? ' cancelled' : (isDelayed ? ' delayed' : '');
+
+        // Build legs detail if there are changes
+        var legsHtml = '';
+        if (changes > 0) {
+          legsHtml = '<div class="trip-legs">';
+          for (var j = 0; j < transportLegs.length; j++) {
+            var l = transportLegs[j];
+            var lOrig = l.Origin || {};
+            var lDest = l.Destination || {};
+            var lDep = (lOrig.rtTime ? fmtTime(lOrig.rtTime) : fmtTime(lOrig.time));
+            var lArr = (lDest.rtTime ? fmtTime(lDest.rtTime) : fmtTime(lDest.time));
+            var lName = (l.Product && (l.Product.displayNumber || l.Product.name)) || l.name || '';
+            var lCancelClass = l.cancelled ? ' cancelled' : '';
+            legsHtml += '<div class="leg-row' + lCancelClass + '">' +
+                          '<span class="leg-dot">●</span>' +
+                          '<span class="leg-time">' + lDep + '</span>' +
+                          '<span>' + escapeHtml(lOrig.name || '') + ' → ' + escapeHtml(lDest.name || '') + ' (' + escapeHtml(lName) + ')</span>' +
+                        '</div>';
+          }
+          legsHtml += '</div>';
+        }
+
+        html += '<div class="trip-card' + cardClass + '">' +
+                  '<div class="trip-top">' +
+                    '<div class="trip-times' + timesClass + '">' + depDisplay + '<span class="arrow">→</span>' + arrDisplay + '</div>' +
+                    '<div class="trip-duration">' + duration + '</div>' +
                   '</div>' +
-                  '<div class="dep-time ' + timeClass + '">' + timeHtml + '</div>' +
+                  '<div class="trip-meta"><span class="lines">' + escapeHtml(linesText) + '</span> · ' + changesText + '</div>' +
+                  '<div class="trip-status ' + statusClass + '"><span class="sdot"></span>' + statusText + '</div>' +
+                  legsHtml +
                 '</div>';
       }
-      container.innerHTML = html;
-      setStatus(true, 'Live');
+
+      container.innerHTML = html || '<div class="empty">No journeys found.</div>';
+
+      // Overall status pill
+      if (cancelledCount === trips.length) setStatus(false, 'All cancelled');
+      else if (cancelledCount > 0) setStatus(false, cancelledCount + ' cancelled');
+      else if (delayedCount > 0) setStatus(true, delayedCount + ' delayed');
+      else setStatus(true, 'Live');
     } catch (err) {
-      container.innerHTML = '<div class="err-box">Could not load departures.<br>' + escapeHtml(err.message) + '</div>';
+      container.innerHTML = '<div class="err-box">Could not load journeys.<br>' + escapeHtml(err.message) + '</div>';
       setStatus(false, 'Error');
     }
   }
@@ -357,8 +443,8 @@ const HTML = `<!DOCTYPE html>
   }
 
   renderRoute();
-  loadStations().then(loadDepartures);
-  setInterval(loadDepartures, 30000);
+  loadStations().then(loadTrips);
+  setInterval(loadTrips, 30000);
 </script>
 </body>
 </html>`;

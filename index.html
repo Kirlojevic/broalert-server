@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BroAlert — Øresund Live</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap');
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0a0a0b; --bg2: #111113; --bg3: #1a1a1d;
+    --border: rgba(255,255,255,0.08); --border2: rgba(255,255,255,0.14);
+    --text: #f0f0f0; --text2: #888; --text3: #555;
+    --green: #1fd67a; --green-dim: rgba(31,214,122,0.12);
+    --red: #ff4d4d; --red-dim: rgba(255,77,77,0.12);
+    --amber: #ffb344; --amber-dim: rgba(255,179,68,0.12);
+    --blue: #4d9eff; --blue-dim: rgba(77,158,255,0.12);
+    --purple: #a78bfa; --purple-dim: rgba(167,139,250,0.1);
+  }
+  body { font-family: 'DM Sans', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; max-width: 440px; margin: 0 auto; padding: 0 0 80px; }
+  .header { padding: 20px 20px 0; display: flex; justify-content: space-between; align-items: center; }
+  .logo { font-size: 20px; font-weight: 600; letter-spacing: -0.5px; }
+  .logo span { color: var(--green); }
+  .status-pill { font-size: 11px; font-weight: 500; padding: 4px 10px; border-radius: 20px; display: flex; align-items: center; gap: 5px; font-family: 'DM Mono', monospace; }
+  .status-pill.ok { background: var(--green-dim); color: var(--green); border: 0.5px solid rgba(31,214,122,0.3); }
+  .status-pill.disruption { background: var(--red-dim); color: var(--red); border: 0.5px solid rgba(255,77,77,0.3); }
+  .status-pill.loading { background: var(--amber-dim); color: var(--amber); border: 0.5px solid rgba(255,179,68,0.3); }
+  .pulse { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse 1.8s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  .route-bar { margin: 16px 20px 0; background: var(--bg3); border: 0.5px solid var(--border); border-radius: 14px; padding: 12px 16px; display: flex; align-items: center; gap: 10px; }
+  .route-side { flex: 1; }
+  .route-arrow { color: var(--text3); font-size: 16px; }
+  .route-label { font-size: 10px; color: var(--text3); font-family: 'DM Mono', monospace; margin-bottom: 2px; }
+  .route-name { font-size: 13px; font-weight: 500; }
+  .tabs { display: flex; margin: 20px 20px 0; background: var(--bg2); border: 0.5px solid var(--border); border-radius: 12px; padding: 3px; gap: 2px; }
+  .tab { flex: 1; padding: 8px 6px; font-size: 12px; font-weight: 500; text-align: center; border-radius: 9px; cursor: pointer; color: var(--text3); border: none; background: none; transition: all 0.15s; font-family: 'DM Sans', sans-serif; }
+  .tab.active { background: var(--bg3); color: var(--text); border: 0.5px solid var(--border2); }
+  .panel { display: none; padding: 16px 20px 0; }
+  .panel.active { display: block; }
+  .big-status { background: var(--bg3); border: 0.5px solid var(--border); border-radius: 18px; padding: 24px 20px; text-align: center; margin-bottom: 14px; }
+  .ring-wrap { width: 80px; height: 80px; border-radius: 50%; border: 1.5px solid var(--border); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; }
+  .ring-inner { width: 56px; height: 56px; border-radius: 50%; display: flex; align-items: center; justify-content: center; transition: all 0.4s; }
+  .ring-inner.ok { background: var(--green-dim); border: 1.5px solid rgba(31,214,122,0.4); }
+  .ring-inner.disruption { background: var(--red-dim); border: 1.5px solid rgba(255,77,77,0.4); }
+  .ring-inner.loading { background: var(--amber-dim); border: 1.5px solid rgba(255,179,68,0.4); }
+  .ring-dot { width: 14px; height: 14px; border-radius: 50%; }
+  .ring-dot.ok { background: var(--green); animation: pulse 2s infinite; }
+  .ring-dot.disruption { background: var(--red); }
+  .ring-dot.loading { background: var(--amber); animation: pulse 1s infinite; }
+  .big-status-title { font-size: 16px; font-weight: 500; margin-bottom: 4px; }
+  .big-status-sub { font-size: 13px; color: var(--text2); line-height: 1.5; }
+  .section-label { font-size: 11px; font-weight: 500; color: var(--text3); font-family: 'DM Mono', monospace; letter-spacing: .06em; text-transform: uppercase; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; }
+  .src-tag { font-size: 10px; padding: 2px 6px; border-radius: 6px; font-family: 'DM Mono', monospace; }
+  .src-se { background: var(--green-dim); color: var(--green); }
+  .src-dk { background: var(--blue-dim); color: var(--blue); }
+  .src-user { background: var(--purple-dim); color: var(--purple); }
+  .dep-card { background: var(--bg3); border: 0.5px solid var(--border); border-radius: 12px; padding: 12px 14px; margin-bottom: 8px; display: flex; align-items: center; gap: 12px; }
+  .dep-card.cancelled { border-color: rgba(255,77,77,0.3); background: rgba(255,77,77,0.05); }
+  .dep-card.delayed { border-color: rgba(255,179,68,0.3); background: rgba(255,179,68,0.05); }
+  .dep-time { font-family: 'DM Mono', monospace; font-size: 16px; font-weight: 500; min-width: 48px; }
+  .dep-time.cancelled { color: var(--red); text-decoration: line-through; }
+  .dep-time.delayed { color: var(--amber); }
+  .dep-body { flex: 1; }
+  .dep-dest { font-size: 13px; font-weight: 500; margin-bottom: 2px; }
+  .dep-detail { font-size: 11px; color: var(--text2); }
+  .dep-badge { font-size: 10px; font-weight: 500; padding: 3px 8px; border-radius: 8px; font-family: 'DM Mono', monospace; white-space: nowrap; }
+  .badge-cancelled { background: var(--red-dim); color: var(--red); }
+  .badge-delayed { background: var(--amber-dim); color: var(--amber); }
+  .badge-ontime { background: var(--green-dim); color: var(--green); }
+  .badge-conf { background: var(--blue-dim); color: var(--blue); }
+  .info-banner { background: var(--bg3); border: 0.5px solid var(--border2); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; font-size: 12px; color: var(--text2); line-height: 1.6; }
+  .info-banner strong { color: var(--text); font-weight: 500; }
+  .taxi-banner { background: var(--amber-dim); border: 0.5px solid rgba(255,179,68,0.3); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; }
+  .taxi-title { font-size: 13px; font-weight: 500; color: var(--amber); margin-bottom: 3px; }
+  .taxi-body { font-size: 12px; color: rgba(255,179,68,0.8); line-height: 1.5; }
+  .taxi-link { font-size: 12px; color: var(--blue); font-weight: 500; margin-top: 5px; display: block; }
+  .comm-post { border-bottom: 0.5px solid var(--border); padding: 12px 0; }
+  .comm-post:last-child { border-bottom: none; }
+  .comm-meta { display: flex; justify-content: space-between; margin-bottom: 5px; }
+  .comm-type { font-size: 10px; font-weight: 500; padding: 2px 7px; border-radius: 6px; font-family: 'DM Mono', monospace; }
+  .ct-bus { background: var(--blue-dim); color: var(--blue); }
+  .ct-ride { background: var(--green-dim); color: var(--green); }
+  .ct-update { background: var(--amber-dim); color: var(--amber); }
+  .ct-warn { background: var(--red-dim); color: var(--red); }
+  .comm-time { font-size: 11px; color: var(--text3); font-family: 'DM Mono', monospace; }
+  .comm-text { font-size: 13px; color: var(--text); line-height: 1.5; margin-bottom: 3px; }
+  .comm-conf { font-size: 11px; color: var(--green); }
+  .comm-link { font-size: 11px; color: var(--blue); font-weight: 500; }
+  .log-card { background: var(--bg3); border: 0.5px solid var(--border); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; }
+  .log-title { font-size: 13px; font-weight: 500; margin-bottom: 8px; }
+  .log-row { display: flex; justify-content: space-between; font-size: 11px; padding: 4px 0; border-top: 0.5px solid var(--border); }
+  .log-label { color: var(--text2); }
+  .log-ok { color: var(--green); font-weight: 500; font-family: 'DM Mono', monospace; }
+  .log-bad { color: var(--red); font-weight: 500; font-family: 'DM Mono', monospace; }
+  .compose-bar { display: flex; gap: 8px; padding: 10px 0 0; border-top: 0.5px solid var(--border); margin-top: 4px; }
+  .compose-input { flex: 1; background: var(--bg3); border: 0.5px solid var(--border2); border-radius: 20px; padding: 9px 14px; font-size: 13px; color: var(--text); font-family: 'DM Sans', sans-serif; outline: none; }
+  .compose-input::placeholder { color: var(--text3); }
+  .mic-btn { width: 36px; height: 36px; border-radius: 50%; background: var(--purple-dim); border: 0.5px solid rgba(167,139,250,0.3); display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; }
+  .bottom-nav { position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); width: 100%; max-width: 440px; background: rgba(10,10,11,0.95); backdrop-filter: blur(12px); border-top: 0.5px solid var(--border); display: flex; padding: 8px 0 16px; }
+  .nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 4px; cursor: pointer; }
+  .nav-bar { width: 20px; height: 3px; border-radius: 2px; transition: background 0.15s; }
+  .nav-bar.on { background: var(--green); }
+  .nav-bar.off { background: var(--border2); }
+  .nav-label { font-size: 10px; color: var(--text3); font-family: 'DM Mono', monospace; transition: color 0.15s; }
+  .nav-label.on { color: var(--green); }
+  .loading-state { text-align: center; padding: 30px 0; color: var(--text3); font-size: 13px; }
+  .spinner { width: 20px; height: 20px; border: 1.5px solid var(--border2); border-top-color: var(--green); border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 10px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .error-state { background: var(--red-dim); border: 0.5px solid rgba(255,77,77,0.3); border-radius: 12px; padding: 12px 14px; font-size: 12px; color: var(--red); margin-bottom: 10px; line-height: 1.6; }
+  .updated-time { font-size: 10px; color: var(--text3); font-family: 'DM Mono', monospace; text-align: center; padding: 6px 0 0; }
+  .setup-box { background: var(--bg3); border: 0.5px solid var(--border2); border-radius: 14px; padding: 16px; margin-bottom: 12px; }
+  .setup-title { font-size: 13px; font-weight: 500; margin-bottom: 6px; color: var(--text); }
+  .setup-desc { font-size: 12px; color: var(--text2); line-height: 1.6; margin-bottom: 10px; }
+  .setup-input { width: 100%; background: var(--bg2); border: 0.5px solid var(--border2); border-radius: 8px; padding: 8px 12px; font-size: 12px; color: var(--text); font-family: 'DM Mono', monospace; outline: none; margin-bottom: 8px; }
+  .setup-btn { background: var(--green-dim); border: 0.5px solid rgba(31,214,122,0.4); color: var(--green); border-radius: 8px; padding: 8px 14px; font-size: 12px; font-weight: 500; cursor: pointer; font-family: 'DM Sans', sans-serif; }
+  .setup-btn:hover { background: rgba(31,214,122,0.2); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">Bro<span>Alert</span></div>
+  <div class="status-pill loading" id="globalStatus">
+    <div class="pulse"></div>
+    <span id="globalStatusText">Connecting…</span>
+  </div>
+</div>
+
+<div class="route-bar">
+  <div class="route-side">
+    <div class="route-label">FROM</div>
+    <div class="route-name">Hyllie</div>
+  </div>
+  <div class="route-arrow">→</div>
+  <div class="route-side">
+    <div class="route-label">TO</div>
+    <div class="route-name">København H</div>
+  </div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('status',this,0)">Status</button>
+  <button class="tab" onclick="switchTab('alternatives',this,1)">Options</button>
+  <button class="tab" onclick="switchTab('community',this,2)">Community</button>
+  <button class="tab" onclick="switchTab('log',this,3)">My log</button>
+</div>
+
+<!-- STATUS PANEL -->
+<div class="panel active" id="panel-status">
+  <div class="big-status">
+    <div class="ring-wrap">
+      <div class="ring-inner loading" id="ringInner">
+        <div class="ring-dot loading" id="ringDot"></div>
+      </div>
+    </div>
+    <div class="big-status-title" id="statusTitle">Connecting to server…</div>
+    <div class="big-status-sub" id="statusSub">Setting up your Railway server first</div>
+  </div>
+
+  <div id="setupSection">
+    <div class="setup-box">
+      <div class="setup-title">Connect your server</div>
+      <div class="setup-desc">Once you have deployed the server to Railway (see instructions below), paste your Railway URL here. It will look like: <span style="color:var(--green);font-family:'DM Mono',monospace">https://broalert-server.up.railway.app</span></div>
+      <input type="text" class="setup-input" id="serverUrl" placeholder="https://your-app.up.railway.app" value="">
+      <button class="setup-btn" onclick="saveServerUrl()">Connect server →</button>
+    </div>
+  </div>
+
+  <div class="section-label" style="margin-top:4px;">
+    Live departures from Hyllie
+    <span class="src-tag src-se">Trafiklab</span>
+  </div>
+  <div id="departuresList">
+    <div class="loading-state"><div class="spinner"></div>Waiting for server connection…</div>
+  </div>
+  <div class="updated-time" id="updatedTime"></div>
+</div>
+
+<!-- OPTIONS PANEL -->
+<div class="panel" id="panel-alternatives">
+  <div class="info-banner" id="altBanner">
+    <strong>Alternatives will appear here automatically</strong><br>
+    When your route is disrupted, this tab shows exactly what to do — which station has trains, where the bus stops, and whether you can claim taxi costs.
+  </div>
+  <div id="altList"></div>
+  <div id="taxiBanner" style="display:none;">
+    <div class="taxi-banner">
+      <div class="taxi-title">You can claim taxi costs back</div>
+      <div class="taxi-body">Delayed 20+ min. Skånetrafiken reimburses taxi and Uber. Keep your receipt. Applies to Danish destinations too.</div>
+      <a href="https://www.skanetrafiken.se/kundservice/forseningsersattning/" target="_blank" class="taxi-link">Apply at skanetrafiken.se →</a>
+    </div>
+  </div>
+</div>
+
+<!-- COMMUNITY PANEL -->
+<div class="panel" id="panel-community">
+  <div class="section-label">Live reports <span class="src-tag src-user">User-reported · not official</span></div>
+  <div id="communityFeed">
+    <div class="comm-post">
+      <div class="comm-meta"><span class="comm-type ct-update">Update</span><span class="comm-time">now</span></div>
+      <div class="comm-text">Community tab is live. Post what you see on the corridor — buses, delays, rides.</div>
+    </div>
+    <div class="comm-post">
+      <div class="comm-meta"><span class="comm-type ct-bus">Bus sighting</span><span class="comm-time">earlier</span></div>
+      <div class="comm-text">Replacement bus at Hyllie Arena stop, heading Kastrup. Multiple buses standing by.</div>
+      <div class="comm-conf">2 confirmed · not yet in Skånetrafiken data</div>
+    </div>
+    <div class="comm-post">
+      <div class="comm-meta"><span class="comm-type ct-ride">Ride offer</span><span class="comm-time">earlier</span></div>
+      <div class="comm-text">Offering ride Malmö C → KH at next disruption. 2 seats. DKK 80.</div>
+      <span class="comm-link">Tap to contact →</span>
+    </div>
+  </div>
+  <div class="compose-bar">
+    <input type="text" class="compose-input" placeholder="Post what you see…" id="communityInput">
+    <div class="mic-btn">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(167,139,250,0.9)" stroke-width="2" stroke-linecap="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0014 0M12 19v4M8 23h8"/></svg>
+    </div>
+  </div>
+</div>
+
+<!-- LOG PANEL -->
+<div class="panel" id="panel-log">
+  <div class="section-label">Delay log <span class="src-tag src-se">Independent</span></div>
+  <div class="info-banner"><strong>Independent logging active.</strong><br>BroAlert records real departure times separately from Skånetrafiken. Evidence for compensation claims if they edit their app.</div>
+  <div class="log-card">
+    <div class="log-title">Today</div>
+    <div class="log-row"><span class="log-label">Monitoring</span><span class="log-ok">Active</span></div>
+    <div class="log-row"><span class="log-label">Route</span><span style="font-family:'DM Mono',monospace;font-size:11px;color:#888">Hyllie → KH</span></div>
+    <div class="log-row"><span class="log-label">Disruptions</span><span class="log-ok" id="logCount">0 today</span></div>
+  </div>
+</div>
+
+<nav class="bottom-nav">
+  <div class="nav-item" onclick="switchTab('status',null,0)">
+    <div class="nav-bar on" id="nav0"></div>
+    <div class="nav-label on" id="navl0">status</div>
+  </div>
+  <div class="nav-item" onclick="switchTab('alternatives',null,1)">
+    <div class="nav-bar off" id="nav1"></div>
+    <div class="nav-label" id="navl1">options</div>
+  </div>
+  <div class="nav-item" onclick="switchTab('community',null,2)">
+    <div class="nav-bar off" id="nav2"></div>
+    <div class="nav-label" id="navl2">community</div>
+  </div>
+  <div class="nav-item" onclick="switchTab('log',null,3)">
+    <div class="nav-bar off" id="nav3"></div>
+    <div class="nav-label" id="navl3">my log</div>
+  </div>
+</nav>
+
+<script>
+let SERVER_URL = localStorage.getItem('broalert_server') || '';
+let hasDisruption = false;
+let disruptionCount = 0;
+
+if (SERVER_URL) {
+  document.getElementById('serverUrl').value = SERVER_URL;
+  document.getElementById('setupSection').style.display = 'none';
+  loadData();
+}
+
+function saveServerUrl() {
+  const url = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
+  if (!url.startsWith('http')) { alert('Please enter a valid URL starting with https://'); return; }
+  SERVER_URL = url;
+  localStorage.setItem('broalert_server', SERVER_URL);
+  document.getElementById('setupSection').style.display = 'none';
+  loadData();
+}
+
+function switchTab(name, btn, idx) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+  if (btn) btn.classList.add('active');
+  [0,1,2,3].forEach(i => {
+    document.getElementById('nav'+i).className = 'nav-bar ' + (i===idx?'on':'off');
+    document.getElementById('navl'+i).className = 'nav-label' + (i===idx?' on':'');
+  });
+}
+
+function setStatus(state, text) {
+  const el = document.getElementById('globalStatus');
+  el.className = 'status-pill ' + state;
+  document.getElementById('globalStatusText').textContent = text;
+}
+
+function setRing(state) {
+  document.getElementById('ringInner').className = 'ring-inner ' + state;
+  document.getElementById('ringDot').className = 'ring-dot ' + state;
+}
+
+function formatTime(t) {
+  if (!t) return '--:--';
+  if (t.includes('T')) return new Date(t).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
+  return t.slice(0,5);
+}
+
+function calcDelay(s, r) {
+  try {
+    const sm = parseInt(s.slice(0,2))*60 + parseInt(s.slice(3,5));
+    const rm = parseInt(r.slice(0,2))*60 + parseInt(r.slice(3,5));
+    return rm - sm;
+  } catch(e) { return 0; }
+}
+
+async function loadData() {
+  if (!SERVER_URL) return;
+  setStatus('loading', 'Loading…');
+  try {
+    const res = await fetch(SERVER_URL + '/api/route-status');
+    if (!res.ok) throw new Error('Server returned ' + res.status);
+    const data = await res.json();
+    renderRouteStatus(data);
+    await loadDepartures();
+  } catch(e) {
+    setStatus('disruption', 'Error');
+    setRing('disruption');
+    document.getElementById('statusTitle').textContent = 'Cannot reach server';
+    document.getElementById('statusSub').textContent = 'Check that your Railway server is running. ' + e.message;
+    document.getElementById('departuresList').innerHTML =
+      '<div class="error-state">Server error: ' + e.message + '<br><br>Make sure your Railway deployment is live and the URL is correct.</div>';
+  }
+}
+
+async function loadDepartures() {
+  if (!SERVER_URL) return;
+  try {
+    const res = await fetch(SERVER_URL + '/api/hyllie');
+    const data = await res.json();
+    const deps = data.Departure || data.departure || [];
+    renderDepartures(deps);
+  } catch(e) {
+    document.getElementById('departuresList').innerHTML =
+      '<div class="error-state">Could not load departures: ' + e.message + '</div>';
+  }
+}
+
+function renderRouteStatus(data) {
+  hasDisruption = data.hasDisruption;
+  if (hasDisruption) {
+    setStatus('disruption', 'Disruption');
+    setRing('disruption');
+    document.getElementById('statusTitle').textContent = 'Disruption detected';
+    document.getElementById('statusSub').textContent =
+      data.disruptions.length + ' issue(s) on your corridor. Check Options tab.';
+    document.getElementById('taxiBanner').style.display = 'block';
+    disruptionCount++;
+    document.getElementById('logCount').textContent = disruptionCount + ' today';
+    renderAlternatives(data.disruptions);
+  } else {
+    setStatus('ok', 'All clear');
+    setRing('ok');
+    document.getElementById('statusTitle').textContent = 'Your route is clear';
+    document.getElementById('statusSub').textContent = 'No cancellations or major delays on the Swedish Øresund corridor.';
+    document.getElementById('taxiBanner').style.display = 'none';
+    document.getElementById('altBanner').innerHTML =
+      '<strong>Route clear.</strong><br>No disruptions on the Swedish side. Alternatives appear here automatically when something changes.';
+    document.getElementById('altList').innerHTML = '';
+  }
+}
+
+function renderDepartures(deps) {
+  const list = document.getElementById('departuresList');
+  if (!deps || deps.length === 0) {
+    list.innerHTML = '<div class="error-state">No departures returned. The stop may have no scheduled services right now.</div>';
+    return;
+  }
+  let html = '';
+  let shown = 0;
+  for (const dep of deps) {
+    if (shown >= 6) break;
+    const direction = dep.direction || dep.Direction?.value || 'Copenhagen';
+    const time = dep.time || '';
+    const rtTime = dep.rtTime || '';
+    const cancelled = dep.cancelled === true || dep.Cancelled === 'true';
+    const delayed = !cancelled && rtTime && rtTime !== time && calcDelay(time, rtTime) > 0;
+    const delayMin = delayed ? calcDelay(time, rtTime) : 0;
+    const name = dep.name || dep.ProductAtStop?.name || '';
+    const track = dep.rtTrack || dep.track || dep.Track || '';
+
+    let cardClass = 'dep-card';
+    let timeClass = 'dep-time';
+    let badge = '<span class="dep-badge badge-ontime">On time</span>';
+
+    if (cancelled) {
+      cardClass = 'dep-card cancelled';
+      timeClass = 'dep-time cancelled';
+      badge = '<span class="dep-badge badge-cancelled">Cancelled</span>';
+    } else if (delayed && delayMin >= 2) {
+      cardClass = 'dep-card delayed';
+      timeClass = 'dep-time delayed';
+      badge = `<span class="dep-badge badge-delayed">+${delayMin} min</span>`;
+    }
+
+    html += `<div class="${cardClass}">
+      <div class="${timeClass}">${formatTime(rtTime || time)}</div>
+      <div class="dep-body">
+        <div class="dep-dest">${direction}</div>
+        <div class="dep-detail">${name}${track ? ' · Platform ' + track : ''}</div>
+      </div>
+      ${badge}
+    </div>`;
+    shown++;
+  }
+  list.innerHTML = html;
+  const now = new Date();
+  document.getElementById('updatedTime').textContent =
+    'Updated ' + now.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}) + ' · refreshes every 60s';
+}
+
+function renderAlternatives(disruptions) {
+  const banner = document.getElementById('altBanner');
+  const list = document.getElementById('altList');
+  banner.innerHTML = `<strong style="color:var(--red)">Disruption on your route.</strong><br>
+    ${disruptions.length} issue(s) detected on the Swedish Øresund corridor. Options below are live from Trafiklab. Danish side (Rejseplanen) connects when key arrives.`;
+
+  let html = `
+    <div class="dep-card" style="border-color:rgba(31,214,122,0.3);margin-bottom:8px">
+      <div class="dep-time" style="color:var(--green);font-size:13px">Best</div>
+      <div class="dep-body">
+        <div class="dep-dest">Pågatågen → Malmö C → Øresundståg</div>
+        <div class="dep-detail">Local train Hyllie → Malmö C 8 min · then cross to DK</div>
+      </div>
+      <span class="dep-badge badge-ontime">SE API</span>
+    </div>
+    <div class="dep-card" style="margin-bottom:8px">
+      <div class="dep-time" style="color:var(--amber);font-size:13px">Bus</div>
+      <div class="dep-body">
+        <div class="dep-dest">Replacement bus — Hyllie Arena stop</div>
+        <div class="dep-detail">Exit station towards arena · bus terminal behind it</div>
+      </div>
+      <span class="dep-badge badge-conf">Unconfirmed</span>
+    </div>
+    <div class="dep-card">
+      <div class="dep-time" style="color:var(--blue);font-size:13px">DK</div>
+      <div class="dep-body">
+        <div class="dep-dest">Danish side — coming when Rejseplanen key arrives</div>
+        <div class="dep-detail">Kastrup · Tårnby · Ørestad · KH alternatives</div>
+      </div>
+      <span class="dep-badge" style="background:var(--blue-dim);color:var(--blue)">Soon</span>
+    </div>`;
+  list.innerHTML = html;
+}
+
+if (SERVER_URL) { setInterval(loadData, 60000); }
+</script>
+</body>
+</html>

@@ -7,20 +7,17 @@ app.use(express.json());
 
 const RESROBOT = '6c964869-c6ab-4d2c-863e-5f9a8463cde0';
 
-// Curated Øresund corridor stations
-// Swedish side: full live data via Trafiklab
-// Danish side: limited until Rejseplanen API is connected
 const STATIONS = [
-  { id: '740001586', name: 'Hyllie',         country: 'SE' },
-  { id: '740001587', name: 'Triangeln',      country: 'SE' },
-  { id: '740000003', name: 'Malmö C',        country: 'SE' },
-  { id: '740000120', name: 'Lund C',         country: 'SE' },
-  { id: '740098001', name: 'Helsingborg C',  country: 'SE' },
+  { id: '740001586', name: 'Hyllie',           country: 'SE' },
+  { id: '740001587', name: 'Triangeln',        country: 'SE' },
+  { id: '740000003', name: 'Malmö C',          country: 'SE' },
+  { id: '740000120', name: 'Lund C',           country: 'SE' },
+  { id: '740098001', name: 'Helsingborg C',    country: 'SE' },
   { id: '740000670', name: 'Kastrup Lufthavn', country: 'DK' },
-  { id: '740000787', name: 'København H',    country: 'DK' },
-  { id: '740000792', name: 'Nørreport',      country: 'DK' },
-  { id: '740000788', name: 'Ørestad',        country: 'DK' },
-  { id: '740000789', name: 'Tårnby',         country: 'DK' }
+  { id: '740000787', name: 'København H',      country: 'DK' },
+  { id: '740000792', name: 'Nørreport',        country: 'DK' },
+  { id: '740000788', name: 'Ørestad',          country: 'DK' },
+  { id: '740000789', name: 'Tårnby',           country: 'DK' }
 ];
 
 async function fetchDepartures(stopId) {
@@ -29,9 +26,7 @@ async function fetchDepartures(stopId) {
   return await r.json();
 }
 
-app.get('/api/stations', (req, res) => {
-  res.json(STATIONS);
-});
+app.get('/api/stations', (req, res) => res.json(STATIONS));
 
 app.get('/api/departures', async (req, res) => {
   try {
@@ -65,15 +60,7 @@ const HTML = `<!DOCTYPE html>
 <title>BroAlert</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #0a0a0b;
-    color: #f0f0f0;
-    min-height: 100vh;
-    max-width: 440px;
-    margin: 0 auto;
-    padding: 20px 16px 80px;
-  }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0b; color: #f0f0f0; min-height: 100vh; max-width: 440px; margin: 0 auto; padding: 20px 16px 80px; }
   .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
   .logo { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
   .logo span { color: #1fd67a; }
@@ -82,28 +69,13 @@ const HTML = `<!DOCTYPE html>
   .status-pill.err { background: rgba(255,77,77,0.12); color: #ff4d4d; border: 0.5px solid rgba(255,77,77,0.3); }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
 
-  .route-box {
-    background: #1a1a1d;
-    border-radius: 14px;
-    padding: 14px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 18px;
-    border: 0.5px solid rgba(255,255,255,0.08);
-  }
+  .route-box { background: #1a1a1d; border-radius: 14px; padding: 14px; display: flex; align-items: center; gap: 8px; margin-bottom: 18px; border: 0.5px solid rgba(255,255,255,0.08); }
   .route-side { flex: 1; cursor: pointer; padding: 4px 6px; border-radius: 8px; }
   .route-side:hover, .route-side:active { background: rgba(255,255,255,0.04); }
   .route-label { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
   .route-name { font-size: 16px; font-weight: 500; display: flex; align-items: center; gap: 6px; }
   .flag { font-size: 11px; opacity: 0.6; }
-  .swap-btn {
-    width: 36px; height: 36px; border-radius: 50%;
-    background: #2a2a2d; border: 0.5px solid rgba(255,255,255,0.1);
-    color: #1fd67a; cursor: pointer; font-size: 18px;
-    display: flex; align-items: center; justify-content: center;
-    flex-shrink: 0; transition: transform 0.2s;
-  }
+  .swap-btn { width: 36px; height: 36px; border-radius: 50%; background: #2a2a2d; border: 0.5px solid rgba(255,255,255,0.1); color: #1fd67a; cursor: pointer; font-size: 18px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: transform 0.2s; }
   .swap-btn:hover { transform: rotate(180deg); }
   .swap-btn:active { background: #1fd67a; color: #0a0a0b; }
 
@@ -115,13 +87,20 @@ const HTML = `<!DOCTYPE html>
   .badge { font-size: 9px; background: rgba(31,214,122,0.15); color: #1fd67a; padding: 3px 8px; border-radius: 20px; letter-spacing: 0.5px; border: 0.5px solid rgba(31,214,122,0.25); }
 
   .dep-list { background: #1a1a1d; border-radius: 12px; overflow: hidden; border: 0.5px solid rgba(255,255,255,0.08); }
-  .dep-row { padding: 14px 16px; border-bottom: 0.5px solid rgba(255,255,255,0.06); display: flex; justify-content: space-between; align-items: center; }
+  .dep-row { padding: 14px 16px; border-bottom: 0.5px solid rgba(255,255,255,0.06); display: flex; justify-content: space-between; align-items: center; gap: 10px; }
   .dep-row:last-child { border-bottom: none; }
+  .dep-info { min-width: 0; flex: 1; }
   .dep-line { font-weight: 600; font-size: 15px; }
-  .dep-dest { font-size: 12px; color: #888; margin-top: 2px; }
-  .dep-time { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .dep-dest { font-size: 12px; color: #888; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dep-status { font-size: 11px; font-weight: 500; margin-top: 6px; display: flex; align-items: center; gap: 5px; }
+  .dep-status .sdot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+  .dep-status.on-time { color: #1fd67a; }
+  .dep-status.delayed { color: #ffb344; }
+  .dep-status.cancelled { color: #ff4d4d; }
+  .dep-time { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; flex-shrink: 0; text-align: right; }
   .dep-time.delayed { color: #ffb344; }
   .dep-time.cancelled { color: #ff4d4d; text-decoration: line-through; }
+  .dep-time .orig { font-size: 11px; font-weight: 400; color: #666; text-decoration: line-through; margin-right: 5px; }
   .empty, .loading { padding: 28px 16px; text-align: center; color: #666; font-size: 13px; }
   .err-box { background: rgba(255,77,77,0.08); border: 0.5px solid rgba(255,77,77,0.3); border-radius: 12px; padding: 16px; color: #ff8080; font-size: 13px; line-height: 1.5; }
   .info-note { background: rgba(255,179,68,0.08); border: 0.5px solid rgba(255,179,68,0.3); border-radius: 12px; padding: 12px 14px; color: #ffb344; font-size: 12px; line-height: 1.4; margin-bottom: 14px; }
@@ -223,9 +202,7 @@ const HTML = `<!DOCTYPE html>
     try {
       var res = await fetch('/api/stations');
       STATIONS = await res.json();
-    } catch (e) {
-      console.error('stations error', e);
-    }
+    } catch (e) {}
   }
 
   function openPicker(target) {
@@ -251,12 +228,8 @@ const HTML = `<!DOCTYPE html>
     document.getElementById('picker-bg').classList.add('on');
   }
 
-  function closePickerIfBg(e) {
-    if (e.target.id === 'picker-bg') closePicker();
-  }
-  function closePicker() {
-    document.getElementById('picker-bg').classList.remove('on');
-  }
+  function closePickerIfBg(e) { if (e.target.id === 'picker-bg') closePicker(); }
+  function closePicker() { document.getElementById('picker-bg').classList.remove('on'); }
 
   function pickStation(id) {
     var station = STATIONS.find(function(s) { return s.id === id; });
@@ -280,6 +253,20 @@ const HTML = `<!DOCTYPE html>
   function fmtTime(t) {
     if (!t) return '--:--';
     return t.substring(0, 5);
+  }
+
+  function parseToMin(t) {
+    if (!t) return 0;
+    var p = t.split(':');
+    return parseInt(p[0], 10) * 60 + parseInt(p[1], 10);
+  }
+
+  function delayMin(scheduled, actual) {
+    var s = parseToMin(scheduled);
+    var a = parseToMin(actual);
+    var diff = a - s;
+    if (diff < -720) diff += 24 * 60; // midnight rollover
+    return diff;
   }
 
   function setStatus(ok, text) {
@@ -318,17 +305,40 @@ const HTML = `<!DOCTYPE html>
         var dest = d.direction || d.directionFlag || '';
         var time = fmtTime(d.time);
         var rtTime = d.rtTime ? fmtTime(d.rtTime) : null;
-        var delayed = rtTime && rtTime !== time;
+        var delay = (rtTime && rtTime !== time) ? delayMin(time, rtTime) : 0;
+        var isDelayed = !cancelled && delay > 0;
 
-        var timeClass = cancelled ? 'cancelled' : (delayed ? 'delayed' : '');
-        var timeDisplay = cancelled ? time : (rtTime || time);
+        // Status label + class
+        var statusClass, statusText;
+        if (cancelled) {
+          statusClass = 'cancelled';
+          statusText = 'Cancelled';
+        } else if (isDelayed) {
+          statusClass = 'delayed';
+          statusText = 'Delayed by ' + delay + ' min';
+        } else {
+          statusClass = 'on-time';
+          statusText = 'On time';
+        }
+
+        // Time column
+        var timeClass = cancelled ? 'cancelled' : (isDelayed ? 'delayed' : '');
+        var timeHtml;
+        if (cancelled) {
+          timeHtml = time;
+        } else if (isDelayed) {
+          timeHtml = '<span class="orig">' + time + '</span>' + rtTime;
+        } else {
+          timeHtml = time;
+        }
 
         html += '<div class="dep-row">' +
-                  '<div>' +
+                  '<div class="dep-info">' +
                     '<div class="dep-line">' + escapeHtml(line) + '</div>' +
                     '<div class="dep-dest">' + escapeHtml(dest) + '</div>' +
+                    '<div class="dep-status ' + statusClass + '"><span class="sdot"></span>' + statusText + '</div>' +
                   '</div>' +
-                  '<div class="dep-time ' + timeClass + '">' + timeDisplay + '</div>' +
+                  '<div class="dep-time ' + timeClass + '">' + timeHtml + '</div>' +
                 '</div>';
       }
       container.innerHTML = html;

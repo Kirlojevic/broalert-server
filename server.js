@@ -7,6 +7,7 @@ app.use(express.json());
 
 const RESROBOT = '6c964869-c6ab-4d2c-863e-5f9a8463cde0';
 
+// Curated Øresund corridor stations
 const STATIONS = [
   { id: '740001586', name: 'Hyllie',           country: 'SE' },
   { id: '740001587', name: 'Triangeln',        country: 'SE' },
@@ -20,37 +21,207 @@ const STATIONS = [
   { id: '740000789', name: 'Tårnby',           country: 'DK' }
 ];
 
+// Linear corridor order (low index = Copenhagen side, high index = north Sweden)
+const CORRIDOR_ORDER = [
+  'København H',
+  'Nørreport',
+  'Ørestad',
+  'Tårnby',
+  'Kastrup Lufthavn',
+  'Hyllie',
+  'Triangeln',
+  'Malmö C',
+  'Lund C',
+  'Helsingborg C'
+];
+
+// Known final destinations for trains continuing past our corridor
+const FAR_NORTH = ['Helsingborg', 'Göteborg', 'Halmstad', 'Karlskrona', 'Kalmar', 'Hässleholm', 'Kristianstad', 'Ängelholm', 'Landskrona', 'Stockholm', 'Hallsberg'];
+const FAR_SOUTH = ['København', 'Helsingør', 'Roskilde', 'Kalundborg', 'Holbæk', 'Nykøbing', 'Lufthavnen', 'Airport'];
+
+// Server-side cache: 30s TTL per station to protect API quota
+const cache = new Map();
+const CACHE_TTL_MS = 30 * 1000;
+
+async function fetchDeparturesCached(stopId) {
+  const key = 'dep:' + stopId;
+  const now = Date.now();
+  const cached = cache.get(key);
+  if (cached && (now - cached.time) < CACHE_TTL_MS) return cached.data;
+
+  const url = 'https://api.resrobot.se/v2.1/departureBoard?id=' + stopId + '&maxJourneys=20&format=json&accessId=' + RESROBOT;
+  const r = await fetch(url);
+  const data = await r.json();
+  cache.set(key, { data, time: now });
+  return data;
+}
+
+// Detect transport mode from a Departure object
+function getMode(dep) {
+  var product = dep.ProductAtStop || (dep.Product && dep.Product[0]) || dep.Product || {};
+  var cat = ((product.catOut || product.catOutS || product.catOutL || '') + '').toLowerCase();
+  var icon = ((product.icon && product.icon.res) || '').toLowerCase();
+  var name = ((product.name || '') + '').toLowerCase();
+
+  if (cat.indexOf('buss') >= 0 || cat.indexOf('bus') >= 0 || icon.indexOf('bus') >= 0 || name.indexOf('buss ') >= 0) return 'bus';
+  if (cat.indexOf('tåg') >= 0 || cat.indexOf('train') >= 0 || cat.indexOf('pågatåg') >= 0 || cat.indexOf('öresund') >= 0 || icon.indexOf('ic') >= 0 || icon.indexOf('train') >= 0) return 'train';
+  // Hafas catCode fallback: 0-2 long-distance/regional trains, 3-5 buses, 6+ ferries/metro
+  var catCode = product.catCode;
+  if (catCode !== undefined) {
+    catCode = parseInt(catCode, 10);
+    if (catCode <= 2) return 'train';
+    if (catCode === 5 || catCode === 7) return 'bus';
+  }
+  return 'other';
+}
+
+function isReplacementBus(dep) {
+  var product = dep.ProductAtStop || (dep.Product && dep.Product[0]) || dep.Product || {};
+  var blob = ((product.name || '') + ' ' + (product.catOut || '') + ' ' + (product.catOutL || '') + ' ' + (dep.name || '') + ' ' + (dep.direction || '')).toLowerCase();
+  // Notes can also reveal it
+  var notes = '';
+  if (dep.Notes && dep.Notes.Note) {
+    var ns = Array.isArray(dep.Notes.Note) ? dep.Notes.Note : [dep.Notes.Note];
+    notes = ns.map(function(n) { return (n.value || n.txtN || '') + ''; }).join(' ').toLowerCase();
+  }
+  var combined = blob + ' ' + notes;
+  return /ersätt|replac|skenersättning|spårersättning|train replacement|rail replacement/.test(combined);
+}
+
+// Is this train direction heading TOWARD destination from currentStation?
+function headingTowardDest(direction, currentStation, destStation) {
+  if (!direction) return false;
+  var dir = direction.trim();
+
+  // Direct match
+  if (dir === destStation) return true;
+  if (dir.indexOf(destStation) === 0) return true;
+
+  var currPos = CORRIDOR_ORDER.indexOf(currentStation);
+  var destPos = CORRIDOR_ORDER.indexOf(destStation);
+  if (currPos === -1 || destPos === -1) return true; // can't decide, include
+
+  var goingNorth = destPos > currPos;
+
+  // If direction is in our corridor and lies further along the travel direction
+  var dirPos = CORRIDOR_ORDER.indexOf(dir);
+  if (dirPos !== -1) {
+    if (goingNorth) return dirPos >= destPos;
+    return dirPos <= destPos;
+  }
+
+  // Otherwise check the known far-destination lists
+  var farList = goingNorth ? FAR_NORTH : FAR_SOUTH;
+  for (var i = 0; i < farList.length; i++) {
+    if (dir.toLowerCase().indexOf(farList[i].toLowerCase()) >= 0) return true;
+  }
+  return false;
+}
+
+function simplifyDeparture(dep) {
+  var product = dep.ProductAtStop || (dep.Product && dep.Product[0]) || dep.Product || {};
+  return {
+    line: product.displayNumber || product.line || dep.transportNumber || dep.name || '',
+    productName: product.name || '',
+    direction: dep.direction || '',
+    time: dep.time || '',
+    rtTime: dep.rtTime || null,
+    cancelled: dep.cancelled === true || dep.Cancelled === 'true',
+    mode: getMode(dep),
+    isReplacement: isReplacementBus(dep)
+  };
+}
+
+// API: list of curated stations
 app.get('/api/stations', (req, res) => res.json(STATIONS));
 
-// Main endpoint: trip planning between FROM and TO
-app.get('/api/trip', async (req, res) => {
+// API: line scan — stations between FROM and TO with trains heading toward TO
+app.get('/api/line-scan', async (req, res) => {
   try {
     const fromId = req.query.from;
     const toId = req.query.to;
     if (!fromId || !toId) return res.status(400).json({ error: 'from and to required' });
 
-    const url = 'https://api.resrobot.se/v2.1/trip' +
-      '?originId=' + fromId +
-      '&destId=' + toId +
-      '&format=json' +
-      '&numF=6' +
-      '&accessId=' + RESROBOT;
+    const fromStation = STATIONS.find(s => s.id === fromId);
+    const toStation = STATIONS.find(s => s.id === toId);
+    if (!fromStation || !toStation) return res.status(400).json({ error: 'unknown stations' });
 
-    const r = await fetch(url);
-    res.json(await r.json());
+    const fromPos = CORRIDOR_ORDER.indexOf(fromStation.name);
+    const toPos = CORRIDOR_ORDER.indexOf(toStation.name);
+    if (fromPos === -1 || toPos === -1) {
+      return res.json({ from: fromStation, to: toStation, supported: false, stations: [] });
+    }
+
+    // Build list of station names from FROM to TO in travel order
+    let names = [];
+    if (fromPos < toPos) for (let i = fromPos; i <= toPos; i++) names.push(CORRIDOR_ORDER[i]);
+    else for (let i = fromPos; i >= toPos; i--) names.push(CORRIDOR_ORDER[i]);
+
+    // Resolve to station objects (with ResRobot ids); skip ones we don't have
+    const stops = names.map(name => STATIONS.find(s => s.name === name)).filter(Boolean);
+
+    const results = [];
+    for (let i = 0; i < stops.length; i++) {
+      const stop = stops[i];
+      const isDestination = stop.name === toStation.name;
+      const isOrigin = stop.name === fromStation.name;
+
+      // The final destination station: we don't need to show departures FROM there
+      if (isDestination) {
+        results.push({ name: stop.name, country: stop.country, isDestination: true, trains: [] });
+        continue;
+      }
+
+      try {
+        const data = await fetchDeparturesCached(stop.id);
+        const allDeps = (data.Departure || []).map(simplifyDeparture);
+
+        const trains = allDeps
+          .filter(d => d.mode === 'train')
+          .filter(d => headingTowardDest(d.direction, stop.name, toStation.name))
+          .slice(0, 3);
+
+        results.push({ name: stop.name, country: stop.country, isOrigin, trains });
+      } catch (e) {
+        results.push({ name: stop.name, country: stop.country, isOrigin, error: e.message, trains: [] });
+      }
+    }
+
+    res.json({ from: fromStation, to: toStation, supported: true, stations: results });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Kept for diagnostics: raw departures from a single station
-app.get('/api/departures', async (req, res) => {
+// API: buses at a station, with replacement detection. Optionally filter to those heading toward dest.
+app.get('/api/buses', async (req, res) => {
   try {
     const stopId = req.query.id;
+    const destName = req.query.dest;
     if (!stopId) return res.status(400).json({ error: 'station id required' });
-    const url = 'https://api.resrobot.se/v2.1/departureBoard?id=' + stopId + '&maxJourneys=12&format=json&accessId=' + RESROBOT;
-    const rr = await fetch(url);
-    res.json(await rr.json());
+
+    const data = await fetchDeparturesCached(stopId);
+    const all = (data.Departure || []).map(simplifyDeparture);
+
+    let buses = all.filter(d => d.mode === 'bus');
+
+    // If destination provided, prioritize buses heading that way (still return others, but flagged)
+    if (destName) {
+      const stop = STATIONS.find(s => s.id === stopId);
+      const origin = stop ? stop.name : null;
+      buses = buses.map(b => ({
+        ...b,
+        likelyTowardDest: origin ? headingTowardDest(b.direction, origin, destName) : false
+      }));
+      buses.sort((a, b) => {
+        // replacements first, then likely-toward-dest, then by time
+        if (a.isReplacement !== b.isReplacement) return a.isReplacement ? -1 : 1;
+        if (a.likelyTowardDest !== b.likelyTowardDest) return a.likelyTowardDest ? -1 : 1;
+        return (a.time || '').localeCompare(b.time || '');
+      });
+    }
+
+    res.json({ buses: buses.slice(0, 8) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -73,6 +244,7 @@ const HTML = `<!DOCTYPE html>
   .status-pill { font-size: 12px; font-weight: 500; padding: 6px 14px; border-radius: 20px; display: flex; align-items: center; gap: 6px; }
   .status-pill.ok { background: rgba(31,214,122,0.12); color: #1fd67a; border: 0.5px solid rgba(31,214,122,0.3); }
   .status-pill.err { background: rgba(255,77,77,0.12); color: #ff4d4d; border: 0.5px solid rgba(255,77,77,0.3); }
+  .status-pill.warn { background: rgba(255,179,68,0.12); color: #ffb344; border: 0.5px solid rgba(255,179,68,0.3); }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
 
   .route-box { background: #1a1a1d; border-radius: 14px; padding: 14px; display: flex; align-items: center; gap: 8px; margin-bottom: 18px; border: 0.5px solid rgba(255,255,255,0.08); }
@@ -89,37 +261,59 @@ const HTML = `<!DOCTYPE html>
   .tab { flex: 1; text-align: center; padding: 10px 0; font-size: 13px; color: #888; border-radius: 9px; cursor: pointer; font-weight: 500; }
   .tab.on { background: #2a2a2d; color: #f0f0f0; }
 
-  .section-label { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin: 6px 0 8px; display: flex; justify-content: space-between; align-items: center; }
-  .badge { font-size: 9px; background: rgba(31,214,122,0.15); color: #1fd67a; padding: 3px 8px; border-radius: 20px; letter-spacing: 0.5px; border: 0.5px solid rgba(31,214,122,0.25); }
+  .section-label { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin: 18px 0 8px; display: flex; justify-content: space-between; align-items: center; }
+  .section-label:first-of-type { margin-top: 6px; }
+  .badge { font-size: 9px; padding: 3px 8px; border-radius: 20px; letter-spacing: 0.5px; }
+  .badge-trafiklab { background: rgba(31,214,122,0.15); color: #1fd67a; border: 0.5px solid rgba(31,214,122,0.25); }
+  .badge-bus { background: rgba(77,158,255,0.15); color: #4d9eff; border: 0.5px solid rgba(77,158,255,0.25); }
 
-  .trip-list { display: flex; flex-direction: column; gap: 10px; }
-  .trip-card { background: #1a1a1d; border-radius: 14px; padding: 14px 16px; border: 0.5px solid rgba(255,255,255,0.08); }
-  .trip-card.cancelled { border-color: rgba(255,77,77,0.4); background: rgba(255,77,77,0.04); }
-  .trip-card.delayed { border-color: rgba(255,179,68,0.3); }
+  /* Line scan */
+  .line-scan { position: relative; padding-left: 24px; }
+  .line-scan::before { content: ''; position: absolute; left: 9px; top: 12px; bottom: 12px; width: 2px; background: rgba(255,255,255,0.1); }
+  .scan-station { position: relative; padding: 4px 0 18px; }
+  .scan-station::before { content: ''; position: absolute; left: -19px; top: 12px; width: 12px; height: 12px; border-radius: 50%; background: #1a1a1d; border: 2px solid #1fd67a; }
+  .scan-station.origin::before { background: #1fd67a; }
+  .scan-station.destination::before { background: #1fd67a; }
+  .scan-station.has-issue::before { border-color: #ffb344; }
+  .scan-station.all-cancelled::before { border-color: #ff4d4d; background: rgba(255,77,77,0.2); }
+  .scan-station-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .scan-station-name { font-size: 15px; font-weight: 600; }
+  .scan-station-name .flag-mini { font-size: 10px; color: #666; margin-left: 6px; font-weight: 400; }
+  .scan-station-tag { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+  .scan-trains { display: flex; flex-direction: column; gap: 6px; }
+  .scan-train { background: #1a1a1d; border: 0.5px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .scan-train.cancelled { border-color: rgba(255,77,77,0.4); background: rgba(255,77,77,0.06); }
+  .scan-train.delayed { border-color: rgba(255,179,68,0.3); }
+  .train-info { min-width: 0; flex: 1; }
+  .train-line { font-size: 13px; font-weight: 600; }
+  .train-direction { font-size: 11px; color: #888; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .train-status { font-size: 10px; margin-top: 4px; display: flex; align-items: center; gap: 4px; font-weight: 500; }
+  .train-status .sdot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .train-status.on-time { color: #1fd67a; }
+  .train-status.delayed { color: #ffb344; }
+  .train-status.cancelled { color: #ff4d4d; }
+  .train-time { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  .train-time.delayed { color: #ffb344; }
+  .train-time.cancelled { color: #ff4d4d; text-decoration: line-through; }
+  .train-time .orig { display: block; font-size: 10px; color: #666; text-decoration: line-through; font-weight: 400; text-align: right; }
+  .scan-empty { font-size: 12px; color: #666; padding: 8px 12px; font-style: italic; }
+  .scan-destination { color: #1fd67a; font-size: 13px; padding: 4px 0; }
 
-  .trip-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 4px; }
-  .trip-times { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .trip-times .arrow { color: #555; margin: 0 6px; }
-  .trip-times.cancelled { color: #ff4d4d; text-decoration: line-through; }
-  .trip-times.delayed { color: #ffb344; }
-  .trip-times .orig { font-size: 12px; color: #666; text-decoration: line-through; margin-right: 4px; font-weight: 400; }
-  .trip-duration { font-size: 12px; color: #888; font-variant-numeric: tabular-nums; }
-
-  .trip-meta { font-size: 12px; color: #aaa; margin-bottom: 8px; }
-  .trip-meta .lines { color: #f0f0f0; font-weight: 500; }
-
-  .trip-status { font-size: 12px; font-weight: 500; display: flex; align-items: center; gap: 6px; }
-  .trip-status .sdot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
-  .trip-status.on-time { color: #1fd67a; }
-  .trip-status.delayed { color: #ffb344; }
-  .trip-status.cancelled { color: #ff4d4d; }
-
-  .trip-legs { margin-top: 10px; padding-top: 10px; border-top: 0.5px solid rgba(255,255,255,0.06); display: flex; flex-direction: column; gap: 6px; }
-  .leg-row { font-size: 11px; color: #888; display: flex; gap: 6px; align-items: baseline; }
-  .leg-row .leg-time { color: #ccc; font-variant-numeric: tabular-nums; min-width: 38px; }
-  .leg-row .leg-dot { color: #1fd67a; }
-  .leg-row.cancelled .leg-time { color: #ff4d4d; text-decoration: line-through; }
-  .leg-row.cancelled .leg-dot { color: #ff4d4d; }
+  /* Buses */
+  .bus-section { background: #1a1a1d; border-radius: 12px; padding: 12px 14px; border: 0.5px solid rgba(255,255,255,0.08); margin-bottom: 10px; }
+  .bus-section-head { font-size: 12px; font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .bus-flag-mini { font-size: 10px; color: #888; font-weight: 400; }
+  .bus-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-top: 0.5px solid rgba(255,255,255,0.05); gap: 10px; }
+  .bus-row:first-of-type { border-top: none; }
+  .bus-info { min-width: 0; flex: 1; }
+  .bus-line { font-size: 13px; font-weight: 500; display: flex; gap: 8px; align-items: center; }
+  .bus-tag { font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: 600; letter-spacing: 0.3px; }
+  .bus-tag.replacement { background: #ffb344; color: #1a1a1d; }
+  .bus-tag.toward { background: rgba(31,214,122,0.15); color: #1fd67a; }
+  .bus-direction { font-size: 11px; color: #888; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bus-time { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  .bus-time.cancelled { color: #ff4d4d; text-decoration: line-through; }
+  .bus-empty { font-size: 12px; color: #666; padding: 6px 0; font-style: italic; }
 
   .empty, .loading { padding: 28px 16px; text-align: center; color: #666; font-size: 13px; }
   .err-box { background: rgba(255,77,77,0.08); border: 0.5px solid rgba(255,77,77,0.3); border-radius: 12px; padding: 16px; color: #ff8080; font-size: 13px; line-height: 1.5; }
@@ -166,20 +360,27 @@ const HTML = `<!DOCTYPE html>
     <div class="tab">My log</div>
   </div>
 
-  <div id="info-note" class="info-note" style="display:none">
-    Danish station routing is limited until the Rejseplanen API is connected.
+  <div id="info-note" class="info-note" style="display:none"></div>
+
+  <div class="section-label">
+    <span>Trains along your route</span>
+    <span class="badge badge-trafiklab">TRAFIKLAB</span>
+  </div>
+
+  <div id="scan-container">
+    <div class="loading">Scanning the line…</div>
   </div>
 
   <div class="section-label">
-    <span>Next journeys <span id="route-summary">Hyllie → København H</span></span>
-    <span class="badge">TRAFIKLAB</span>
+    <span>Buses &amp; replacements at your endpoints</span>
+    <span class="badge badge-bus">BUSES</span>
   </div>
 
-  <div id="trip-container" class="trip-list">
-    <div class="loading">Loading next journeys…</div>
+  <div id="bus-container">
+    <div class="loading">Checking buses…</div>
   </div>
 
-  <button class="refresh" onclick="loadTrips()">Refresh</button>
+  <button class="refresh" onclick="loadEverything()">Refresh</button>
 
   <div id="picker-bg" class="modal-bg" onclick="closePickerIfBg(event)">
     <div class="modal" onclick="event.stopPropagation()">
@@ -214,9 +415,6 @@ const HTML = `<!DOCTYPE html>
     document.getElementById('to-name').textContent = state.to.name;
     document.getElementById('from-flag').textContent = state.from.country;
     document.getElementById('to-flag').textContent = state.to.country;
-    document.getElementById('route-summary').textContent = state.from.name + ' → ' + state.to.name;
-    var hasDanish = state.from.country === 'DK' || state.to.country === 'DK';
-    document.getElementById('info-note').style.display = hasDanish ? 'block' : 'none';
   }
 
   async function loadStations() {
@@ -259,7 +457,7 @@ const HTML = `<!DOCTYPE html>
     saveRoute();
     renderRoute();
     closePicker();
-    loadTrips();
+    loadEverything();
   }
 
   function swapStations() {
@@ -268,7 +466,7 @@ const HTML = `<!DOCTYPE html>
     state.to = tmp;
     saveRoute();
     renderRoute();
-    loadTrips();
+    loadEverything();
   }
 
   function fmtTime(t) { return t ? t.substring(0, 5) : '--:--'; }
@@ -287,151 +485,188 @@ const HTML = `<!DOCTYPE html>
     return diff;
   }
 
-  function parseDurationISO(iso) {
-    // PT1H22M or PT22M
-    if (!iso) return '';
-    var m = iso.match(/PT(?:(\\d+)H)?(?:(\\d+)M)?/);
-    if (!m) return '';
-    var h = parseInt(m[1] || '0', 10);
-    var min = parseInt(m[2] || '0', 10);
-    if (h === 0) return min + ' min';
-    return h + ' h ' + min + ' min';
-  }
-
-  function setStatus(ok, text) {
+  function setStatus(level, text) {
     var pill = document.getElementById('status-pill');
-    pill.className = 'status-pill ' + (ok ? 'ok' : 'err');
+    pill.className = 'status-pill ' + level;
     document.getElementById('status-text').textContent = text;
   }
 
-  async function loadTrips() {
-    var container = document.getElementById('trip-container');
-    container.innerHTML = '<div class="loading">Loading next journeys…</div>';
-    try {
-      var url = '/api/trip?from=' + encodeURIComponent(state.from.id) + '&to=' + encodeURIComponent(state.to.id);
-      var res = await fetch(url);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      var data = await res.json();
+  function renderTrainRow(train) {
+    var time = fmtTime(train.time);
+    var rt = train.rtTime ? fmtTime(train.rtTime) : null;
+    var delay = (rt && rt !== time) ? delayMin(time, rt) : 0;
+    var cancelled = train.cancelled;
+    var isDelayed = !cancelled && delay > 0;
 
-      if (data.error) throw new Error(data.error);
-      if (data.errorCode) throw new Error(data.errorText || data.errorCode);
+    var statusClass, statusText;
+    if (cancelled) { statusClass = 'cancelled'; statusText = 'Cancelled'; }
+    else if (isDelayed) { statusClass = 'delayed'; statusText = 'Delayed ' + delay + ' min'; }
+    else { statusClass = 'on-time'; statusText = 'On time'; }
 
-      var trips = data.Trip || [];
-      if (trips.length === 0) {
-        container.innerHTML = '<div class="empty">No journeys found between these stations right now.</div>';
-        setStatus(true, 'No data');
-        return;
+    var timeClass = cancelled ? 'cancelled' : (isDelayed ? 'delayed' : '');
+    var timeHtml = cancelled ? time
+      : (isDelayed ? '<span class="orig">' + time + '</span>' + rt : time);
+
+    var cardClass = cancelled ? ' cancelled' : (isDelayed ? ' delayed' : '');
+
+    return '<div class="scan-train' + cardClass + '">' +
+             '<div class="train-info">' +
+               '<div class="train-line">' + escapeHtml(train.line || 'Train') + '</div>' +
+               '<div class="train-direction">→ ' + escapeHtml(train.direction || '') + '</div>' +
+               '<div class="train-status ' + statusClass + '"><span class="sdot"></span>' + statusText + '</div>' +
+             '</div>' +
+             '<div class="train-time ' + timeClass + '">' + timeHtml + '</div>' +
+           '</div>';
+  }
+
+  function renderLineScan(data) {
+    var container = document.getElementById('scan-container');
+
+    if (!data.supported) {
+      container.innerHTML = '<div class="err-box">Route between these stations is outside the supported Øresund corridor for now.</div>';
+      return { allCancelled: false, anyIssue: false, totalTrains: 0 };
+    }
+
+    var stations = data.stations || [];
+    if (stations.length === 0) {
+      container.innerHTML = '<div class="empty">No stations to scan.</div>';
+      return { allCancelled: false, anyIssue: false, totalTrains: 0 };
+    }
+
+    var html = '<div class="line-scan">';
+    var anyIssue = false, anyOK = false, totalTrains = 0, allOriginCancelled = false;
+
+    for (var i = 0; i < stations.length; i++) {
+      var st = stations[i];
+      var trains = st.trains || [];
+
+      if (st.isDestination) {
+        html += '<div class="scan-station destination">' +
+                  '<div class="scan-station-head">' +
+                    '<div class="scan-station-name">' + escapeHtml(st.name) + ' <span class="flag-mini">' + st.country + '</span></div>' +
+                    '<div class="scan-station-tag">Destination</div>' +
+                  '</div>' +
+                  '<div class="scan-destination">Arrival station — buses below if needed</div>' +
+                '</div>';
+        continue;
       }
 
-      var html = '';
-      var cancelledCount = 0, delayedCount = 0;
+      var cancelledHere = trains.filter(function(t) { return t.cancelled; }).length;
+      var delayedHere = trains.filter(function(t) { return !t.cancelled && t.rtTime && t.rtTime !== t.time; }).length;
+      var stationClass = '';
+      if (trains.length > 0 && cancelledHere === trains.length) { stationClass = ' all-cancelled'; anyIssue = true; if (st.isOrigin) allOriginCancelled = true; }
+      else if (cancelledHere > 0 || delayedHere > 0) { stationClass = ' has-issue'; anyIssue = true; }
+      else if (trains.length > 0) { anyOK = true; }
 
-      for (var i = 0; i < trips.length; i++) {
-        var trip = trips[i];
-        var legs = (trip.LegList && trip.LegList.Leg) || [];
-        if (!Array.isArray(legs)) legs = [legs];
+      if (st.isOrigin) stationClass += ' origin';
+      totalTrains += trains.length;
 
-        var transportLegs = legs.filter(function(l) { return l.type !== 'WALK'; });
-        if (transportLegs.length === 0) continue;
-
-        var firstLeg = transportLegs[0];
-        var lastLeg = transportLegs[transportLegs.length - 1];
-
-        var origin = firstLeg.Origin || {};
-        var dest = lastLeg.Destination || {};
-
-        var depTime = fmtTime(origin.time);
-        var depRt = origin.rtTime ? fmtTime(origin.rtTime) : null;
-        var arrTime = fmtTime(dest.time);
-        var arrRt = dest.rtTime ? fmtTime(dest.rtTime) : null;
-
-        var tripCancelled = legs.some(function(l) { return l.cancelled === true; });
-        var depDelay = (depRt && depRt !== depTime) ? delayMin(depTime, depRt) : 0;
-        var arrDelay = (arrRt && arrRt !== arrTime) ? delayMin(arrTime, arrRt) : 0;
-        var maxDelay = Math.max(depDelay, arrDelay);
-        var isDelayed = !tripCancelled && maxDelay > 0;
-
-        if (tripCancelled) cancelledCount++;
-        else if (isDelayed) delayedCount++;
-
-        // Lines (train names)
-        var lineNames = transportLegs.map(function(l) {
-          return (l.Product && (l.Product.displayNumber || l.Product.name)) || l.name || '';
-        }).filter(Boolean);
-        var linesText = lineNames.join(' → ');
-
-        var changes = transportLegs.length - 1;
-        var changesText = changes === 0 ? 'Direct' : (changes + ' change' + (changes > 1 ? 's' : ''));
-        var duration = parseDurationISO(trip.duration);
-
-        // Status badge
-        var statusClass, statusText;
-        if (tripCancelled) {
-          statusClass = 'cancelled';
-          statusText = 'Cancelled';
-        } else if (isDelayed) {
-          statusClass = 'delayed';
-          statusText = 'Delayed by ' + maxDelay + ' min';
-        } else {
-          statusClass = 'on-time';
-          statusText = 'On time';
+      var trainsHtml = '';
+      if (trains.length === 0) {
+        trainsHtml = '<div class="scan-empty">No trains toward ' + escapeHtml(state.to.name) + ' in the next window.</div>';
+      } else {
+        for (var j = 0; j < trains.length; j++) {
+          trainsHtml += renderTrainRow(trains[j]);
         }
+      }
 
-        // Times display
-        var depDisplay, arrDisplay;
-        if (tripCancelled) {
-          depDisplay = depTime;
-          arrDisplay = arrTime;
-        } else {
-          depDisplay = (depRt && depRt !== depTime) ? '<span class="orig">' + depTime + '</span>' + depRt : depTime;
-          arrDisplay = (arrRt && arrRt !== arrTime) ? '<span class="orig">' + arrTime + '</span>' + arrRt : arrTime;
-        }
+      var tag = st.isOrigin ? 'Origin' : 'Stop';
 
-        var cardClass = tripCancelled ? ' cancelled' : (isDelayed ? ' delayed' : '');
-        var timesClass = tripCancelled ? ' cancelled' : (isDelayed ? ' delayed' : '');
+      html += '<div class="scan-station' + stationClass + '">' +
+                '<div class="scan-station-head">' +
+                  '<div class="scan-station-name">' + escapeHtml(st.name) + ' <span class="flag-mini">' + st.country + '</span></div>' +
+                  '<div class="scan-station-tag">' + tag + '</div>' +
+                '</div>' +
+                '<div class="scan-trains">' + trainsHtml + '</div>' +
+              '</div>';
+    }
 
-        // Build legs detail if there are changes
-        var legsHtml = '';
-        if (changes > 0) {
-          legsHtml = '<div class="trip-legs">';
-          for (var j = 0; j < transportLegs.length; j++) {
-            var l = transportLegs[j];
-            var lOrig = l.Origin || {};
-            var lDest = l.Destination || {};
-            var lDep = (lOrig.rtTime ? fmtTime(lOrig.rtTime) : fmtTime(lOrig.time));
-            var lArr = (lDest.rtTime ? fmtTime(lDest.rtTime) : fmtTime(lDest.time));
-            var lName = (l.Product && (l.Product.displayNumber || l.Product.name)) || l.name || '';
-            var lCancelClass = l.cancelled ? ' cancelled' : '';
-            legsHtml += '<div class="leg-row' + lCancelClass + '">' +
-                          '<span class="leg-dot">●</span>' +
-                          '<span class="leg-time">' + lDep + '</span>' +
-                          '<span>' + escapeHtml(lOrig.name || '') + ' → ' + escapeHtml(lDest.name || '') + ' (' + escapeHtml(lName) + ')</span>' +
-                        '</div>';
-          }
-          legsHtml += '</div>';
-        }
+    html += '</div>';
+    container.innerHTML = html;
+    return { allOriginCancelled: allOriginCancelled, anyIssue: anyIssue, totalTrains: totalTrains };
+  }
 
-        html += '<div class="trip-card' + cardClass + '">' +
-                  '<div class="trip-top">' +
-                    '<div class="trip-times' + timesClass + '">' + depDisplay + '<span class="arrow">→</span>' + arrDisplay + '</div>' +
-                    '<div class="trip-duration">' + duration + '</div>' +
+  function renderBusSection(label, country, buses) {
+    var html = '<div class="bus-section">' +
+                 '<div class="bus-section-head">' + escapeHtml(label) + ' <span class="bus-flag-mini">' + country + '</span></div>';
+
+    if (!buses || buses.length === 0) {
+      html += '<div class="bus-empty">No buses listed at this station right now.</div>';
+    } else {
+      for (var i = 0; i < buses.length; i++) {
+        var b = buses[i];
+        var time = fmtTime(b.time);
+        var rt = b.rtTime ? fmtTime(b.rtTime) : null;
+        var timeDisplay = b.cancelled ? time : (rt || time);
+        var timeClass = b.cancelled ? 'cancelled' : '';
+
+        var tags = '';
+        if (b.isReplacement) tags += '<span class="bus-tag replacement">REPLACEMENT</span>';
+        if (b.likelyTowardDest) tags += '<span class="bus-tag toward">TOWARD ' + escapeHtml(state.to.name.toUpperCase()) + '</span>';
+
+        html += '<div class="bus-row">' +
+                  '<div class="bus-info">' +
+                    '<div class="bus-line">' + escapeHtml(b.line || 'Bus') + ' ' + tags + '</div>' +
+                    '<div class="bus-direction">→ ' + escapeHtml(b.direction || '') + '</div>' +
                   '</div>' +
-                  '<div class="trip-meta"><span class="lines">' + escapeHtml(linesText) + '</span> · ' + changesText + '</div>' +
-                  '<div class="trip-status ' + statusClass + '"><span class="sdot"></span>' + statusText + '</div>' +
-                  legsHtml +
+                  '<div class="bus-time ' + timeClass + '">' + timeDisplay + '</div>' +
                 '</div>';
       }
+    }
+    html += '</div>';
+    return html;
+  }
 
-      container.innerHTML = html || '<div class="empty">No journeys found.</div>';
+  async function loadEverything() {
+    var scanContainer = document.getElementById('scan-container');
+    var busContainer = document.getElementById('bus-container');
+    var infoNote = document.getElementById('info-note');
+    scanContainer.innerHTML = '<div class="loading">Scanning the line…</div>';
+    busContainer.innerHTML = '<div class="loading">Checking buses…</div>';
+    infoNote.style.display = 'none';
 
-      // Overall status pill
-      if (cancelledCount === trips.length) setStatus(false, 'All cancelled');
-      else if (cancelledCount > 0) setStatus(false, cancelledCount + ' cancelled');
-      else if (delayedCount > 0) setStatus(true, delayedCount + ' delayed');
-      else setStatus(true, 'Live');
+    try {
+      // Line scan
+      var scanRes = await fetch('/api/line-scan?from=' + state.from.id + '&to=' + state.to.id);
+      var scanData = await scanRes.json();
+      if (scanData.error) throw new Error(scanData.error);
+
+      var summary = renderLineScan(scanData);
+
+      // Buses at FROM and TO
+      var fromBusReq = fetch('/api/buses?id=' + state.from.id + '&dest=' + encodeURIComponent(state.to.name));
+      var toBusReq = fetch('/api/buses?id=' + state.to.id + '&dest=' + encodeURIComponent(state.from.name));
+      var fromBusData = await (await fromBusReq).json();
+      var toBusData = await (await toBusReq).json();
+
+      var busHtml = renderBusSection('Buses at ' + state.from.name, state.from.country, fromBusData.buses);
+      busHtml += renderBusSection('Buses at ' + state.to.name, state.to.country, toBusData.buses);
+      busContainer.innerHTML = busHtml;
+
+      // Status pill summary
+      if (summary.allOriginCancelled) {
+        setStatus('err', 'Cancelled at origin');
+        infoNote.style.display = 'block';
+        infoNote.textContent = 'All trains from ' + state.from.name + ' toward ' + state.to.name + ' are cancelled. Check replacement buses below — or the next station up the line.';
+      } else if (summary.anyIssue) {
+        setStatus('warn', 'Disruptions');
+      } else if (summary.totalTrains > 0) {
+        setStatus('ok', 'Live');
+      } else {
+        setStatus('warn', 'No trains found');
+      }
+
+      // Danish-side note
+      if (state.from.country === 'DK' || state.to.country === 'DK') {
+        if (!infoNote.textContent) {
+          infoNote.style.display = 'block';
+          infoNote.textContent = 'Danish-side coverage is limited until the Rejseplanen API is connected.';
+        }
+      }
     } catch (err) {
-      container.innerHTML = '<div class="err-box">Could not load journeys.<br>' + escapeHtml(err.message) + '</div>';
-      setStatus(false, 'Error');
+      scanContainer.innerHTML = '<div class="err-box">Could not load line scan.<br>' + escapeHtml(err.message) + '</div>';
+      busContainer.innerHTML = '';
+      setStatus('err', 'Error');
     }
   }
 
@@ -443,8 +678,8 @@ const HTML = `<!DOCTYPE html>
   }
 
   renderRoute();
-  loadStations().then(loadTrips);
-  setInterval(loadTrips, 30000);
+  loadStations().then(loadEverything);
+  setInterval(loadEverything, 60000);
 </script>
 </body>
 </html>`;

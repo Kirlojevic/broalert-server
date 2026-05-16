@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 
+const VERSION = 'v19-arrival-debug-2026-05-16';
+
 app.use(cors());
 app.use(express.json());
 
@@ -140,7 +142,6 @@ function getTrack(dep) {
   return null;
 }
 
-// Normalize a station name for comparison: strip generic words, unify spellings
 function normName(n) {
   if (!n) return '';
   var s = String(n).toLowerCase();
@@ -152,12 +153,10 @@ function normName(n) {
   return s;
 }
 
-// Split into clean lowercase words with possessive 's' stripped
 function nameWords(n) {
   if (!n) return [];
   var s = String(n).toLowerCase().replace(/\([^)]*\)/g, ' ');
   return s.split(/[\s\.\,;:]+/).filter(Boolean).map(function(w) {
-    // Strip trailing Swedish possessive s on words ≥4 chars (preserves "buss", "bus", "ts" type words by length)
     if (w.length >= 5 && w[w.length - 1] === 's') return w.slice(0, -1);
     return w;
   });
@@ -175,8 +174,6 @@ function nameMatches(stopName, target) {
   if (sn === tn) return true;
   if (tn.length >= 4 && sn.indexOf(tn) >= 0) return true;
   if (sn.length >= 4 && tn.indexOf(sn) >= 0) return true;
-
-  // Word-based: all distinctive target words must appear among stop words
   var sWords = nameWords(stopName);
   var tWords = nameWords(target);
   function distinctive(w) { return GENERIC_WORDS.indexOf(w) < 0 && w.length >= 3; }
@@ -193,7 +190,16 @@ function nameMatches(stopName, target) {
   return true;
 }
 
-// STRICT: arrival is shown only when the train actually reaches the user's chosen destination.
+// Map any API station name to the preferred name from our STATIONS list (if a match exists)
+function preferredStationName(apiName) {
+  if (!apiName) return null;
+  for (var i = 0; i < STATIONS.length; i++) {
+    if (nameMatches(apiName, STATIONS[i].name)) return STATIONS[i].name;
+  }
+  return apiName;
+}
+
+// STRICT: only the user's chosen destination, only the arrival time field (no depTime fallback).
 function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
   if (!dep.Stops || !dep.Stops.Stop) return null;
   var stops = Array.isArray(dep.Stops.Stop) ? dep.Stops.Stop : [dep.Stops.Stop];
@@ -211,17 +217,19 @@ function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
     var stop = stops[j];
     var isDest = (destId && (stop.extId === destId || stop.id === destId)) || nameMatches(stop.name, destName);
     if (isDest) {
+      // Only use the real arrival field; if missing, return null (no fake fallback)
+      if (!stop.arrTime && !stop.rtArrTime) return null;
       return {
-        name: stop.name,
-        time: stop.arrTime || stop.depTime || null,
-        rtTime: stop.rtArrTime || stop.rtDepTime || null
+        name: preferredStationName(stop.name) || stop.name,
+        time: stop.arrTime || null,
+        rtTime: stop.rtArrTime || null,
+        matchedApiName: stop.name
       };
     }
   }
   return null;
 }
 
-// STRICT: bus arrival is shown only when its terminus matches the user's chosen destination.
 function findBusArrivalAtDest(dep, destId, destName) {
   if (!dep.Stops || !dep.Stops.Stop) return null;
   var stops = Array.isArray(dep.Stops.Stop) ? dep.Stops.Stop : [dep.Stops.Stop];
@@ -229,13 +237,13 @@ function findBusArrivalAtDest(dep, destId, destName) {
   var last = stops[stops.length - 1];
   var matches = (destId && (last.extId === destId || last.id === destId)) || nameMatches(last.name, destName);
   if (!matches) {
-    // Also check the direction string as a fallback (some buses have minimal passlist)
     if (!nameMatches(dep.direction, destName)) return null;
   }
+  if (!last.arrTime && !last.rtArrTime) return null;
   return {
-    name: last.name || dep.direction,
-    time: last.arrTime || last.depTime || null,
-    rtTime: last.rtArrTime || last.rtDepTime || null
+    name: preferredStationName(last.name) || last.name,
+    time: last.arrTime || null,
+    rtTime: last.rtArrTime || null
   };
 }
 
@@ -245,14 +253,12 @@ function trainAdvancesTowardRoute(dep, currentId, currentName, usefulIds, useful
   if (!stops) return null;
   if (!Array.isArray(stops)) stops = [stops];
   if (stops.length === 0) return null;
-
   var currentIdx = -1;
   for (var i = 0; i < stops.length; i++) {
     var s = stops[i];
     if (currentId && (s.extId === currentId || s.id === currentId)) { currentIdx = i; break; }
     if (nameMatches(s.name, currentName)) { currentIdx = i; break; }
   }
-
   var startIdx = currentIdx >= 0 ? currentIdx + 1 : 0;
   for (var j = startIdx; j < stops.length; j++) {
     var stop = stops[j];
@@ -312,6 +318,7 @@ function simplifyDeparture(dep) {
   };
 }
 
+app.get('/api/version', (req, res) => res.json({ version: VERSION, timestamp: new Date().toISOString() }));
 app.get('/api/stations', (req, res) => res.json(STATIONS));
 
 app.get('/api/debug', async (req, res) => {
@@ -320,19 +327,18 @@ app.get('/api/debug', async (req, res) => {
     const data = await fetchDeparturesCached(stopId);
     const deps = (data.Departure || []).slice(0, 3);
     res.json({
-      stopId, count: deps.length,
+      version: VERSION, stopId, count: deps.length,
       departures: deps.map(d => ({
         classified_as: getMode(d),
         detected_category: getTrainCategory(d),
         track: getTrack(d),
-        category_blob: buildCategoryBlob(d),
         stops_count: (d.Stops && d.Stops.Stop) ? (Array.isArray(d.Stops.Stop) ? d.Stops.Stop.length : 1) : 0,
-        first_three_stops: (d.Stops && d.Stops.Stop) ? (Array.isArray(d.Stops.Stop) ? d.Stops.Stop.slice(0, 3) : [d.Stops.Stop]) : [],
-        raw: {
-          name: d.name, type: d.type, direction: d.direction,
-          track: d.track, rtTrack: d.rtTrack,
-          ProductAtStop: d.ProductAtStop, Product: d.Product, Notes: d.Notes
-        }
+        all_stops: (d.Stops && d.Stops.Stop) ? (Array.isArray(d.Stops.Stop) ? d.Stops.Stop : [d.Stops.Stop]).map(s => ({
+          name: s.name, extId: s.extId, id: s.id,
+          arrTime: s.arrTime, rtArrTime: s.rtArrTime,
+          depTime: s.depTime, rtDepTime: s.rtDepTime
+        })) : [],
+        raw: { name: d.name, type: d.type, direction: d.direction, track: d.track, rtTrack: d.rtTrack }
       }))
     });
   } catch (e) {
@@ -353,7 +359,7 @@ app.get('/api/line-scan', async (req, res) => {
     const fromPos = CORRIDOR_ORDER.indexOf(fromStation.name);
     const toPos = CORRIDOR_ORDER.indexOf(toStation.name);
     if (fromPos === -1 || toPos === -1) {
-      return res.json({ from: fromStation, to: toStation, supported: false, stations: [] });
+      return res.json({ version: VERSION, from: fromStation, to: toStation, supported: false, stations: [] });
     }
 
     let names = [];
@@ -430,7 +436,7 @@ app.get('/api/line-scan', async (req, res) => {
       });
     }
 
-    res.json({ from: fromStation, to: toStation, supported: true, stations: results });
+    res.json({ version: VERSION, from: fromStation, to: toStation, supported: true, stations: results });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -466,7 +472,7 @@ app.get('/api/buses', async (req, res) => {
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status: 'ok', version: VERSION, timestamp: new Date().toISOString() }));
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -548,13 +554,14 @@ const HTML = `<!DOCTYPE html>
   .train-status.delayed { color: #ffb344; }
   .train-status.cancelled { color: #ff4d4d; }
 
-  .train-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 78px; }
+  .train-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 80px; }
   .train-time { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1; }
   .train-time.delayed { color: #ffb344; }
   .train-time.cancelled { color: #ff4d4d; text-decoration: line-through; }
   .train-time .orig { display: block; font-size: 10px; color: #666; text-decoration: line-through; font-weight: 400; }
-  .train-arrival { font-size: 11px; font-variant-numeric: tabular-nums; line-height: 1.2; color: #1fd67a; font-weight: 600; display: flex; align-items: center; gap: 3px; }
+  .train-arrival { font-size: 11px; font-variant-numeric: tabular-nums; line-height: 1; color: #1fd67a; font-weight: 600; display: flex; align-items: center; gap: 3px; }
   .train-arrival .arrow { color: #1fd67a; font-size: 9px; }
+  .train-arr-station { font-size: 10px; color: #1fd67a; font-weight: 500; line-height: 1.1; }
   .train-track { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; padding: 1px 6px; border: 0.5px solid rgba(255,255,255,0.15); border-radius: 4px; }
   .scan-empty { font-size: 12px; color: #666; padding: 8px 12px; font-style: italic; }
   .scan-destination { color: #1fd67a; font-size: 13px; padding: 4px 0; }
@@ -570,17 +577,19 @@ const HTML = `<!DOCTYPE html>
   .bus-tag.toward { background: rgba(31,214,122,0.15); color: #1fd67a; border: 0.5px solid rgba(31,214,122,0.3); }
   .bus-route-line { font-size: 11px; color: #aaa; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .bus-from { color: #ffb344; font-weight: 500; }
-  .bus-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 78px; }
+  .bus-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 80px; }
   .bus-time { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1; }
   .bus-time.cancelled { color: #ff4d4d; text-decoration: line-through; }
-  .bus-arrival { font-size: 11px; font-variant-numeric: tabular-nums; color: #1fd67a; font-weight: 600; line-height: 1.2; display: flex; align-items: center; gap: 3px; }
+  .bus-arrival { font-size: 11px; font-variant-numeric: tabular-nums; color: #1fd67a; font-weight: 600; line-height: 1; display: flex; align-items: center; gap: 3px; }
   .bus-arrival .arrow { color: #1fd67a; font-size: 9px; }
+  .bus-arr-station { font-size: 10px; color: #1fd67a; font-weight: 500; line-height: 1.1; }
   .bus-track { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; padding: 1px 6px; border: 0.5px solid rgba(255,255,255,0.15); border-radius: 4px; }
 
   .empty, .loading { padding: 28px 16px; text-align: center; color: #666; font-size: 13px; }
   .err-box { background: rgba(255,77,77,0.08); border: 0.5px solid rgba(255,77,77,0.3); border-radius: 12px; padding: 16px; color: #ff8080; font-size: 13px; line-height: 1.5; }
   .refresh { width: 100%; background: #1a1a1d; color: #f0f0f0; border: 0.5px solid rgba(255,255,255,0.1); padding: 12px; border-radius: 12px; margin-top: 14px; cursor: pointer; font-size: 13px; font-weight: 500; }
   .refresh:hover { background: #2a2a2d; }
+  .footer { text-align: center; color: #444; font-size: 10px; margin-top: 18px; letter-spacing: 0.3px; }
 
   .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(6px); display: none; align-items: flex-end; justify-content: center; z-index: 100; }
   .modal-bg.on { display: flex; }
@@ -640,6 +649,8 @@ const HTML = `<!DOCTYPE html>
   <div id="bus-container"></div>
 
   <button class="refresh" onclick="loadEverything()">Refresh</button>
+
+  <div class="footer" id="footer">BroAlert ` + VERSION + `</div>
 
   <div id="picker-bg" class="modal-bg" onclick="closePickerIfBg(event)">
     <div class="modal" onclick="event.stopPropagation()">
@@ -736,10 +747,22 @@ const HTML = `<!DOCTYPE html>
     return '<div class="train-track">Spår ' + escapeHtml(track) + '</div>';
   }
 
-  function destArrivalBlock(arrTime, rtArrTime, cancelled) {
-    if (cancelled || !arrTime) return '';
+  // Sanity-check: anything > 210 minutes (3.5h) between departure and arrival on the Øresund corridor is bogus
+  function sanityCheckJourney(depTime, arrTime) {
+    if (!depTime || !arrTime) return false;
+    var dep = parseToMin(fmtTime(depTime));
+    var arr = parseToMin(fmtTime(arrTime));
+    var diff = arr - dep;
+    if (diff < 0) diff += 24 * 60;
+    return diff >= 0 && diff <= 210;
+  }
+
+  function destArrivalBlock(arrTime, rtArrTime, cancelled, depTime, arrAt) {
+    if (cancelled || !arrTime || !arrAt) return '';
     var arr = rtArrTime ? fmtTime(rtArrTime) : fmtTime(arrTime);
-    return '<div class="train-arrival"><span class="arrow">→</span>' + arr + '</div>';
+    if (!sanityCheckJourney(depTime, arrTime)) return '';
+    return '<div class="train-arrival"><span class="arrow">→</span>' + arr + '</div>' +
+           '<div class="train-arr-station">' + escapeHtml(arrAt) + '</div>';
   }
 
   function renderTrainRow(train) {
@@ -768,7 +791,7 @@ const HTML = `<!DOCTYPE html>
              '</div>' +
              '<div class="train-right">' +
                '<div class="train-time ' + timeClass + '">' + timeHtml + '</div>' +
-               destArrivalBlock(train.arrTime, train.rtArrTime, cancelled) +
+               destArrivalBlock(train.arrTime, train.rtArrTime, cancelled, train.time, train.arrAt) +
                trackBadge(train.track) +
              '</div>' +
            '</div>';
@@ -780,6 +803,10 @@ const HTML = `<!DOCTYPE html>
       container.innerHTML = '<div class="err-box">Route between these stations is outside the supported Øresund corridor for now.</div>';
       return { totalStop: false, anyIssue: false, totalTrains: 0, firstWorkingIdx: -1, originOK: false, replacements: [] };
     }
+    // Surface the deployed version too
+    var foot = document.getElementById('footer');
+    if (foot && data.version) foot.textContent = 'BroAlert ' + data.version;
+
     var stations = data.stations || [];
     if (stations.length === 0) {
       container.innerHTML = '<div class="empty">No stations to scan.</div>';
@@ -852,9 +879,11 @@ const HTML = `<!DOCTYPE html>
   }
 
   function busArrivalBlock(b) {
-    if (b.cancelled || !b.arrTime) return '';
+    if (b.cancelled || !b.arrTime || !b.arrAt) return '';
+    if (!sanityCheckJourney(b.time, b.arrTime)) return '';
     var arrT = b.rtArrTime ? fmtTime(b.rtArrTime) : fmtTime(b.arrTime);
-    return '<div class="bus-arrival"><span class="arrow">→</span>' + arrT + '</div>';
+    return '<div class="bus-arrival"><span class="arrow">→</span>' + arrT + '</div>' +
+           '<div class="bus-arr-station">' + escapeHtml(b.arrAt) + '</div>';
   }
 
   function renderBusSection(replacements, directToDest) {
@@ -980,9 +1009,10 @@ const HTML = `<!DOCTYPE html>
 </html>`;
 
 app.get('/', (req, res) => {
+  res.set('Cache-Control', 'no-store');
   res.set('Content-Type', 'text/html; charset=utf-8');
   res.send(HTML);
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('BroAlert server running on port ' + PORT));
+app.listen(PORT, () => console.log('BroAlert ' + VERSION + ' running on port ' + PORT));

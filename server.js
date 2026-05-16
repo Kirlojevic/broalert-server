@@ -25,16 +25,15 @@ const CORRIDOR_ORDER = [
   'Hyllie', 'Triangeln', 'Malmö C', 'Lund C', 'Helsingborg C'
 ];
 
-// Heuristic fallback only — used when passlist data is unavailable
 const FAR_NORTH = ['Helsingborg', 'Göteborg', 'Halmstad', 'Karlskrona', 'Kalmar', 'Hässleholm',
                    'Kristianstad', 'Ängelholm', 'Landskrona', 'Stockholm', 'Hallsberg',
-                   'Eslöv', 'Höör', 'Sösdala', 'Markaryd'];
+                   'Eslöv', 'Höör', 'Sösdala', 'Markaryd', 'Kävlinge'];
 const FAR_SOUTH = ['København', 'Köpenhamn', 'Köpenhavn', 'Helsingør', 'Roskilde',
                    'Kalundborg', 'Holbæk', 'Nykøbing', 'Lufthavnen', 'Lufthavn',
                    'Airport', 'Trelleborg', 'Næstved', 'Ringsted'];
 
 const cache = new Map();
-const CACHE_TTL_MS = 45 * 1000;
+const CACHE_TTL_MS = 60 * 1000;
 
 async function fetchDeparturesCached(stopId) {
   const key = 'dep:' + stopId;
@@ -42,7 +41,6 @@ async function fetchDeparturesCached(stopId) {
   const cached = cache.get(key);
   if (cached && (now - cached.time) < CACHE_TTL_MS) return cached.data;
 
-  // passlist=1 returns each train's full stop list so we can check pass-through accurately
   const url = 'https://api.resrobot.se/v2.1/departureBoard?id=' + stopId +
               '&maxJourneys=25&passlist=1&format=json&accessId=' + RESROBOT;
   const r = await fetch(url);
@@ -83,35 +81,54 @@ function normName(n) {
   return (n || '').toLowerCase().replace(/[\s\.\,;:]/g, '');
 }
 
-// Primary check: does this train's pass-list contain destination AFTER current station?
-function trainPassesDestByPasslist(dep, currentId, destId, destName) {
+// Primary check: does this train pass through any of the "useful" stations after the current one?
+// usefulIds + usefulNames represent all stations remaining on the route after currentStation.
+function trainAdvancesTowardRoute(dep, currentId, currentName, usefulIds, usefulNames) {
   if (!dep.Stops) return null;
   var stops = dep.Stops.Stop;
   if (!stops) return null;
   if (!Array.isArray(stops)) stops = [stops];
   if (stops.length === 0) return null;
 
-  // Find current station position
+  // Find current station position in train's passlist
   var currentIdx = -1;
+  var currentN = normName(currentName);
   for (var i = 0; i < stops.length; i++) {
     var s = stops[i];
-    if (currentId && (s.extId === currentId || s.id === currentId)) { currentIdx = i; break; }
+    var matchId = currentId && (s.extId === currentId || s.id === currentId);
+    var matchName = false;
+    if (!matchId && currentN) {
+      var sn = normName(s.name);
+      matchName = (sn === currentN) || (sn.endsWith(currentN));
+    }
+    if (matchId || matchName) { currentIdx = i; break; }
   }
 
-  // Search for destination, AFTER current if known
-  var destN = normName(destName);
+  // Build normalized useful name set once
+  var usefulN = [];
+  if (usefulNames) for (var k = 0; k < usefulNames.length; k++) usefulN.push(normName(usefulNames[k]));
+
+  // Look at stops AFTER current (or from start if not found)
   var startIdx = currentIdx >= 0 ? currentIdx + 1 : 0;
   for (var j = startIdx; j < stops.length; j++) {
-    var st = stops[j];
-    if (destId && (st.extId === destId || st.id === destId)) return true;
-    var sn = normName(st.name);
-    if (destN && (sn === destN || sn.endsWith(destN))) return true;
+    var stop = stops[j];
+    if (usefulIds) {
+      for (var u = 0; u < usefulIds.length; u++) {
+        if (stop.extId === usefulIds[u] || stop.id === usefulIds[u]) return true;
+      }
+    }
+    if (usefulN.length > 0 && stop.name) {
+      var sn2 = normName(stop.name);
+      for (var n = 0; n < usefulN.length; n++) {
+        if (usefulN[n] && (sn2 === usefulN[n] || sn2.endsWith(usefulN[n]))) return true;
+      }
+    }
   }
   return false;
 }
 
-// Heuristic fallback: only used when passlist is missing
-function headingTowardDestByDirection(direction, currentStation, destStation) {
+// Heuristic fallback (no passlist): train direction must be in the correct corridor direction
+function headingInRightDirection(direction, currentStation, destStation) {
   if (!direction) return false;
   var dir = direction.trim();
   if (dir === destStation) return true;
@@ -125,8 +142,8 @@ function headingTowardDestByDirection(direction, currentStation, destStation) {
   var goingNorth = destPos > currPos;
   var dirPos = CORRIDOR_ORDER.indexOf(dir);
   if (dirPos !== -1) {
-    if (goingNorth) return dirPos >= destPos;
-    return dirPos <= destPos;
+    if (goingNorth) return dirPos > currPos; // any station past current in right direction
+    return dirPos < currPos;
   }
   var farList = goingNorth ? FAR_NORTH : FAR_SOUTH;
   for (var i = 0; i < farList.length; i++) {
@@ -168,15 +185,15 @@ app.get('/api/line-scan', async (req, res) => {
       return res.json({ from: fromStation, to: toStation, supported: false, stations: [] });
     }
 
+    // Build the ordered list of stations along the route from FROM to TO
     let names = [];
     if (fromPos < toPos) for (let i = fromPos; i <= toPos; i++) names.push(CORRIDOR_ORDER[i]);
     else for (let i = fromPos; i >= toPos; i--) names.push(CORRIDOR_ORDER[i]);
-
-    const stops = names.map(name => STATIONS.find(s => s.name === name)).filter(Boolean);
+    const routeStops = names.map(name => STATIONS.find(s => s.name === name)).filter(Boolean);
 
     const results = [];
-    for (let i = 0; i < stops.length; i++) {
-      const stop = stops[i];
+    for (let i = 0; i < routeStops.length; i++) {
+      const stop = routeStops[i];
       const isDestination = stop.name === toStation.name;
       const isOrigin = stop.name === fromStation.name;
 
@@ -185,6 +202,11 @@ app.get('/api/line-scan', async (req, res) => {
         continue;
       }
 
+      // Useful stops = all stations remaining on the route AFTER this one
+      const remaining = routeStops.slice(i + 1);
+      const remainingIds = remaining.map(s => s.id);
+      const remainingNames = remaining.map(s => s.name);
+
       try {
         const data = await fetchDeparturesCached(stop.id);
         const allDeps = (data.Departure || []).map(simplifyDeparture);
@@ -192,12 +214,11 @@ app.get('/api/line-scan', async (req, res) => {
         const trains = allDeps
           .filter(d => d.mode === 'train')
           .filter(d => {
-            // Primary: definitive check via passlist
-            const passes = trainPassesDestByPasslist(d._raw, stop.id, toStation.id, toStation.name);
-            if (passes === true) return true;
-            if (passes === false) return false;
-            // Fallback: direction heuristic when passlist is missing
-            return headingTowardDestByDirection(d.direction, stop.name, toStation.name);
+            const advances = trainAdvancesTowardRoute(d._raw, stop.id, stop.name, remainingIds, remainingNames);
+            if (advances === true) return true;
+            if (advances === false) return false;
+            // Fallback when passlist missing
+            return headingInRightDirection(d.direction, stop.name, toStation.name);
           })
           .slice(0, 4)
           .map(d => ({
@@ -226,16 +247,14 @@ app.get('/api/buses', async (req, res) => {
 
     const data = await fetchDeparturesCached(stopId);
     const all = (data.Departure || []).map(simplifyDeparture);
+    const stop = STATIONS.find(s => s.id === stopId);
 
     let buses = all.filter(d => d.mode === 'bus').map(d => {
       let towardDest = false;
-      if (destId || destName) {
-        const passes = trainPassesDestByPasslist(d._raw, stopId, destId, destName);
+      if ((destId || destName) && stop) {
+        const passes = trainAdvancesTowardRoute(d._raw, stopId, stop.name, destId ? [destId] : null, destName ? [destName] : null);
         if (passes === true) towardDest = true;
-        else if (passes === null) {
-          const stop = STATIONS.find(s => s.id === stopId);
-          if (stop) towardDest = headingTowardDestByDirection(d.direction, stop.name, destName);
-        }
+        else if (passes === null) towardDest = headingInRightDirection(d.direction, stop.name, destName);
       }
       return {
         line: d.line, productName: d.productName, direction: d.direction,
@@ -574,7 +593,7 @@ const HTML = `<!DOCTYPE html>
 
       var trainsHtml = '';
       if (trains.length === 0) {
-        trainsHtml = '<div class="scan-empty">No trains toward ' + escapeHtml(state.to.name) + ' in the next window.</div>';
+        trainsHtml = '<div class="scan-empty">No trains advancing toward ' + escapeHtml(state.to.name) + ' in the next window.</div>';
       } else {
         for (var j = 0; j < trains.length; j++) trainsHtml += renderTrainRow(trains[j]);
       }
@@ -680,7 +699,7 @@ const HTML = `<!DOCTYPE html>
 
   renderRoute();
   loadStations().then(loadEverything);
-  setInterval(loadEverything, 90000);
+  setInterval(loadEverything, 120000);
 </script>
 </body>
 </html>`;

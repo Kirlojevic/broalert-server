@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 
-const VERSION = 'v21-corridor-estimate-2026-05-16';
+const VERSION = 'v22-direction-fallback-2026-05-16';
 
 app.use(cors());
 app.use(express.json());
@@ -27,9 +27,6 @@ const CORRIDOR_ORDER = [
   'Hyllie', 'Triangeln', 'Malmö C', 'Lund C', 'Helsingborg C'
 ];
 
-// Typical journey time between adjacent corridor stations (Öresundståg-class service).
-// Used as a fallback when Trafiklab's passlist arrival data is missing or implausible
-// (common for cross-border trains until Rejseplanen API is added).
 const CORRIDOR_LEG_MINUTES = {
   'København H|Nørreport': 3,
   'Nørreport|Ørestad': 6,
@@ -47,7 +44,7 @@ const FAR_NORTH = ['Helsingborg', 'Göteborg', 'Halmstad', 'Karlskrona', 'Kalmar
                    'Eslöv', 'Höör', 'Sösdala', 'Markaryd', 'Kävlinge'];
 const FAR_SOUTH = ['København', 'Köpenhamn', 'Köpenhavn', 'Helsingør', 'Roskilde',
                    'Kalundborg', 'Holbæk', 'Nykøbing', 'Lufthavnen', 'Lufthavn',
-                   'Airport', 'Trelleborg', 'Næstved', 'Ringsted'];
+                   'Airport', 'Trelleborg', 'Næstved', 'Ringsted', 'Østerport', 'Österport'];
 
 const cache = new Map();
 const CACHE_TTL_MS = 90 * 1000;
@@ -228,7 +225,6 @@ function preferredStationName(apiName) {
   return apiName;
 }
 
-// Time math helpers
 function parseToMinSrv(t) {
   if (!t) return 0;
   var p = String(t).split(':');
@@ -265,16 +261,47 @@ function estimateCorridorMinutes(fromName, toName) {
   return total;
 }
 
-// Returns arrival info for the user's chosen destination.
-// Tries Trafiklab passlist first; if that data is missing or fails sanity,
-// falls back to a corridor-leg estimate so cross-border trains still show
-// a reasonable arrival time. Returns null only if the train doesn't reach
-// the destination at all.
-function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
-  if (!dep.Stops || !dep.Stops.Stop) return null;
-  var stops = Array.isArray(dep.Stops.Stop) ? dep.Stops.Stop : [dep.Stops.Stop];
-  if (stops.length === 0) return null;
+// Decide whether a train's stated direction implies it passes through the user's destination.
+function trainDirectionPassesDest(direction, currentName, destName) {
+  if (!direction || !currentName || !destName) return false;
+  var dir = String(direction).trim();
+  if (nameMatches(dir, destName)) return true;
 
+  var currIdx = CORRIDOR_ORDER.indexOf(currentName);
+  var destIdx = CORRIDOR_ORDER.indexOf(destName);
+  if (currIdx === -1 || destIdx === -1) return false;
+  var goingSouth = destIdx < currIdx;
+
+  // 1) Direction names a corridor station — compare positions
+  var dirIdx = -1;
+  for (var k = 0; k < CORRIDOR_ORDER.length; k++) {
+    if (nameMatches(dir, CORRIDOR_ORDER[k])) { dirIdx = k; break; }
+  }
+  if (dirIdx !== -1) {
+    if (goingSouth) return dirIdx <= destIdx;
+    return dirIdx >= destIdx;
+  }
+
+  // 2) Direction is off-corridor — check FAR lists
+  var dirLow = dir.toLowerCase();
+  var farList = goingSouth ? FAR_SOUTH : FAR_NORTH;
+  for (var i = 0; i < farList.length; i++) {
+    if (dirLow.indexOf(farList[i].toLowerCase()) >= 0) return true;
+  }
+  return false;
+}
+
+// Returns the arrival info for the user's chosen destination.
+// Strategy:
+//   1) If the destination is in the train's passlist with a sane API time → use it (live).
+//   2) If found but API time bad/missing → corridor estimate.
+//   3) If NOT found in passlist but train's terminus implies it passes through → corridor estimate.
+//   4) Otherwise null.
+function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
+  var hasPasslist = dep.Stops && dep.Stops.Stop;
+  var stops = hasPasslist ? (Array.isArray(dep.Stops.Stop) ? dep.Stops.Stop : [dep.Stops.Stop]) : [];
+
+  // Locate the current station in passlist (or default to 0)
   var currentIdx = -1;
   for (var i = 0; i < stops.length; i++) {
     var s = stops[i];
@@ -282,9 +309,15 @@ function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
     if (nameMatches(s.name, currentName)) { currentIdx = i; break; }
   }
   if (currentIdx < 0) currentIdx = 0;
-  var currentStop = stops[currentIdx];
-  var depTimeHere = currentStop ? (currentStop.rtDepTime || currentStop.depTime || null) : null;
 
+  // Departure time from current station — prefer the stop's depTime, fall back to the train's top-level time
+  var depTimeHere = null;
+  if (stops[currentIdx]) {
+    depTimeHere = stops[currentIdx].rtDepTime || stops[currentIdx].depTime || null;
+  }
+  if (!depTimeHere) depTimeHere = dep.rtTime || dep.time || null;
+
+  // Walk forward through passlist looking for destination
   for (var j = currentIdx + 1; j < stops.length; j++) {
     var stop = stops[j];
     var matchedById = destId && (stop.extId === destId || stop.id === destId);
@@ -294,41 +327,50 @@ function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
       var rtArrTime = stop.rtArrTime || null;
       var prefName = preferredStationName(stop.name) || stop.name || destName;
 
-      // If the API gave us a time, decide if it's sane
+      // 1) Sane live API time?
       if ((arrTime || rtArrTime) && depTimeHere) {
         var checkAgainst = rtArrTime || arrTime;
         var journey = diffMinSrv(depTimeHere, checkAgainst);
         if (journey > 0 && journey <= 120) {
           return {
-            name: prefName,
-            time: arrTime,
-            rtTime: rtArrTime,
-            isEstimate: false,
-            matchedApiName: stop.name,
-            matchedExtId: stop.extId,
-            matchedById: !!matchedById
+            name: prefName, time: arrTime, rtTime: rtArrTime,
+            isEstimate: false, source: 'passlist',
+            matchedApiName: stop.name, matchedExtId: stop.extId, matchedById: !!matchedById
           };
         }
       }
 
-      // API time missing or implausible — fall back to corridor estimate
+      // 2) Found but data unusable → estimate
       if (depTimeHere) {
         var est = estimateCorridorMinutes(currentName, destName);
         if (est != null && est > 0) {
           return {
-            name: prefName,
-            time: addMinutes(depTimeHere, est),
-            rtTime: null,
-            isEstimate: true,
-            matchedApiName: stop.name,
-            matchedExtId: stop.extId,
-            matchedById: !!matchedById
+            name: prefName, time: addMinutes(depTimeHere, est), rtTime: null,
+            isEstimate: true, source: 'estimate-bad-passlist-time',
+            matchedApiName: stop.name, matchedExtId: stop.extId, matchedById: !!matchedById
           };
         }
       }
       return null;
     }
   }
+
+  // 3) Destination NOT in passlist — but does the direction imply it passes through?
+  if (depTimeHere && trainDirectionPassesDest(dep.direction, currentName, destName)) {
+    var est2 = estimateCorridorMinutes(currentName, destName);
+    if (est2 != null && est2 > 0) {
+      return {
+        name: preferredStationName(destName) || destName,
+        time: addMinutes(depTimeHere, est2),
+        rtTime: null,
+        isEstimate: true,
+        source: 'estimate-no-passlist',
+        matchedApiName: null,
+        matchedById: false
+      };
+    }
+  }
+
   return null;
 }
 
@@ -532,7 +574,8 @@ app.get('/api/line-scan', async (req, res) => {
             arrTime: arr ? arr.time : null,
             rtArrTime: arr ? arr.rtTime : null,
             arrAt: arr ? arr.name : null,
-            arrIsEstimate: arr ? !!arr.isEstimate : false
+            arrIsEstimate: arr ? !!arr.isEstimate : false,
+            arrSource: arr ? arr.source : null
           };
           if (debug) {
             out._passlist = (d._raw.Stops && d._raw.Stops.Stop)
@@ -701,7 +744,7 @@ const HTML = `<!DOCTYPE html>
   .refresh { width: 100%; background: #1a1a1d; color: #f0f0f0; border: 0.5px solid rgba(255,255,255,0.1); padding: 12px; border-radius: 12px; margin-top: 14px; cursor: pointer; font-size: 13px; font-weight: 500; }
   .refresh:hover { background: #2a2a2d; }
   .footer { text-align: center; color: #444; font-size: 10px; margin-top: 18px; letter-spacing: 0.3px; }
-  .estimate-legend { text-align: center; color: #888; font-size: 10px; margin-top: 14px; padding: 8px 12px; background: rgba(255,179,68,0.04); border: 0.5px solid rgba(255,179,68,0.15); border-radius: 8px; }
+  .estimate-legend { text-align: center; color: #888; font-size: 10px; margin-top: 14px; padding: 8px 12px; background: rgba(255,179,68,0.04); border: 0.5px solid rgba(255,179,68,0.15); border-radius: 8px; line-height: 1.4; }
   .estimate-legend strong { color: #ffb344; }
   .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(6px); display: none; align-items: flex-end; justify-content: center; z-index: 100; }
   .modal-bg.on { display: flex; }
@@ -761,7 +804,7 @@ const HTML = `<!DOCTYPE html>
   <div id="bus-container"></div>
 
   <div id="estimate-legend" class="estimate-legend" style="display:none">
-    <strong>~estimated</strong> arrivals are computed from typical corridor times when Trafiklab's data is incomplete (e.g. cross-border trains). Live Danish data arrives once the Rejseplanen API is connected.
+    <strong>~estimated</strong> arrivals are computed from typical corridor times when Trafiklab's data is incomplete (common for cross-border trains). Live Danish data will arrive once the Rejseplanen API is connected.
   </div>
 
   <button class="refresh" onclick="loadEverything()">Refresh</button>
@@ -880,7 +923,6 @@ const HTML = `<!DOCTYPE html>
     return rtArrTime;
   }
 
-  // Tracks whether any estimate appeared in the rendered set (used to show legend)
   var sawAnyEstimate = false;
 
   function destArrivalBlock(arrTime, rtArrTime, cancelled, depTime, arrAt, isEstimate) {
@@ -1003,7 +1045,6 @@ const HTML = `<!DOCTYPE html>
     }
     html += '</div>';
     container.innerHTML = html;
-    // Show estimate legend only if any estimate appeared
     var legend = document.getElementById('estimate-legend');
     legend.style.display = sawAnyEstimate ? 'block' : 'none';
     return {

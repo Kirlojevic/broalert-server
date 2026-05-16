@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 
-const VERSION = 'v25-dynamic-station-ids-2026-05-16';
+const VERSION = 'v26-stations-extended-2026-05-16';
 
 app.use(cors());
 app.use(express.json());
@@ -17,10 +17,14 @@ const STATIONS = [
   { id: '740001587', name: 'Triangeln',        country: 'SE', resolved: false },
   { id: '740000003', name: 'Malmö C',          country: 'SE', resolved: false },
   { id: '740000120', name: 'Lund C',           country: 'SE', resolved: false },
+  { id: '740001000', name: 'Kävlinge',         country: 'SE', resolved: false },
+  { id: '740001001', name: 'Landskrona',       country: 'SE', resolved: false },
+  { id: '740001002', name: 'Ramlösa',          country: 'SE', resolved: false },
   { id: '740098001', name: 'Helsingborg C',    country: 'SE', resolved: false },
   { id: '740000670', name: 'Kastrup Lufthavn', country: 'DK', resolved: false },
   { id: '740000787', name: 'København H',      country: 'DK', resolved: false },
   { id: '740000792', name: 'Nørreport',        country: 'DK', resolved: false },
+  { id: '740000790', name: 'Østerport',        country: 'DK', resolved: false },
   { id: '740000788', name: 'Ørestad',          country: 'DK', resolved: false },
   { id: '740000789', name: 'Tårnby',           country: 'DK', resolved: false }
 ];
@@ -33,29 +37,42 @@ const SEARCH_TERMS = {
   'Triangeln':        ['Malmö Triangeln', 'Triangeln'],
   'Malmö C':          ['Malmö Centralstation'],
   'Lund C':           ['Lund Centralstation'],
+  'Kävlinge':         ['Kävlinge station', 'Kävlinge'],
+  'Landskrona':       ['Landskrona station', 'Landskrona'],
+  'Ramlösa':          ['Helsingborg Ramlösa', 'Ramlösa station', 'Ramlösa'],
   'Helsingborg C':    ['Helsingborg Centralstation', 'Helsingborg knutpunkten', 'Helsingborg C'],
   'Kastrup Lufthavn': ['Københavns Lufthavn Kastrup', 'Kastrup Lufthavn', 'Copenhagen Airport'],
   'København H':      ['København H', 'København Hovedbanegård', 'Copenhagen Central Station'],
   'Nørreport':        ['København Nørreport', 'Nørreport'],
+  'Østerport':        ['København Østerport', 'Østerport st', 'Østerport'],
   'Ørestad':          ['København Ørestad', 'Ørestad'],
   'Tårnby':           ['Tårnby']
 };
 
+// Index 0 = deepest north in Denmark (Østerport, past København H)
+// Index 13 = deepest north in Sweden (Helsingborg C)
+// The order reflects actual geography: Østerport sits *north* of Nørreport, which sits north of København H
 const CORRIDOR_ORDER = [
-  'København H', 'Nørreport', 'Ørestad', 'Tårnby', 'Kastrup Lufthavn',
-  'Hyllie', 'Triangeln', 'Malmö C', 'Lund C', 'Helsingborg C'
+  'Østerport', 'Nørreport', 'København H', 'Ørestad', 'Tårnby', 'Kastrup Lufthavn',
+  'Hyllie', 'Triangeln', 'Malmö C', 'Lund C',
+  'Kävlinge', 'Landskrona', 'Ramlösa', 'Helsingborg C'
 ];
 
+// Adjacent-station travel times in minutes. Pågatåg/all-stop figures where applicable.
 const CORRIDOR_LEG_MINUTES = {
-  'København H|Nørreport': 3,
-  'Nørreport|Ørestad': 6,
+  'Østerport|Nørreport': 2,
+  'Nørreport|København H': 3,
+  'København H|Ørestad': 7,
   'Ørestad|Tårnby': 4,
   'Tårnby|Kastrup Lufthavn': 3,
   'Kastrup Lufthavn|Hyllie': 12,
   'Hyllie|Triangeln': 4,
   'Triangeln|Malmö C': 4,
   'Malmö C|Lund C': 13,
-  'Lund C|Helsingborg C': 38
+  'Lund C|Kävlinge': 11,
+  'Kävlinge|Landskrona': 9,
+  'Landskrona|Ramlösa': 12,
+  'Ramlösa|Helsingborg C': 3
 };
 
 const FAR_NORTH = ['Helsingborg', 'Göteborg', 'Halmstad', 'Karlskrona', 'Kalmar', 'Hässleholm',

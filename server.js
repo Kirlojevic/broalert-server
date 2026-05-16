@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 
-const VERSION = 'v19-arrival-debug-2026-05-16';
+const VERSION = 'v20-strict-arrival-2026-05-16';
 
 app.use(cors());
 app.use(express.json());
@@ -42,7 +42,6 @@ async function fetchDeparturesCached(stopId) {
   const now = Date.now();
   const cached = cache.get(key);
   if (cached && (now - cached.time) < CACHE_TTL_MS) return cached.data;
-
   const url = 'https://api.resrobot.se/v2.1/departureBoard?id=' + stopId +
               '&maxJourneys=40&passlist=1&format=json&accessId=' + RESROBOT;
   const r = await fetch(url);
@@ -166,14 +165,35 @@ var GENERIC_WORDS = ['c', 'central', 'centralen', 'centralstation', 'station', '
                      'lufthavn', 'lufthavnen', 'airport', 'tog', 'banegård', 'banegard',
                      'knutpunkt', 'knutpunkten'];
 
+function isWordChar(c) { return /[a-zåäöæøéè]/i.test(c); }
+
+// Returns true if `needle` appears as a whole word within `haystack`
+function wordBoundaryContains(haystack, needle) {
+  if (!haystack || !needle || needle.length < 3) return false;
+  var idx = haystack.indexOf(needle);
+  while (idx !== -1) {
+    var before = idx === 0 ? ' ' : haystack[idx - 1];
+    var after = (idx + needle.length >= haystack.length) ? ' ' : haystack[idx + needle.length];
+    if (!isWordChar(before) && !isWordChar(after)) return true;
+    idx = haystack.indexOf(needle, idx + 1);
+  }
+  return false;
+}
+
 function nameMatches(stopName, target) {
   if (!stopName || !target) return false;
   var sn = normName(stopName);
   var tn = normName(target);
   if (!sn || !tn) return false;
   if (sn === tn) return true;
-  if (tn.length >= 4 && sn.indexOf(tn) >= 0) return true;
-  if (sn.length >= 4 && tn.indexOf(sn) >= 0) return true;
+
+  // Word-boundary substring match — prevents "Hyllie" matching "Hyllievången"
+  var stopL = String(stopName).toLowerCase().replace(/\([^)]*\)/g, ' ');
+  var targetL = String(target).toLowerCase().replace(/\([^)]*\)/g, ' ');
+  if (wordBoundaryContains(stopL, targetL)) return true;
+  if (wordBoundaryContains(targetL, stopL)) return true;
+
+  // Word-based matching for possessive-s / generic-suffix variants ("Lunds C" vs "Lund C")
   var sWords = nameWords(stopName);
   var tWords = nameWords(target);
   function distinctive(w) { return GENERIC_WORDS.indexOf(w) < 0 && w.length >= 3; }
@@ -190,7 +210,6 @@ function nameMatches(stopName, target) {
   return true;
 }
 
-// Map any API station name to the preferred name from our STATIONS list (if a match exists)
 function preferredStationName(apiName) {
   if (!apiName) return null;
   for (var i = 0; i < STATIONS.length; i++) {
@@ -199,7 +218,7 @@ function preferredStationName(apiName) {
   return apiName;
 }
 
-// STRICT: only the user's chosen destination, only the arrival time field (no depTime fallback).
+// STRICT: only the user's chosen destination, only real arrTime field
 function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
   if (!dep.Stops || !dep.Stops.Stop) return null;
   var stops = Array.isArray(dep.Stops.Stop) ? dep.Stops.Stop : [dep.Stops.Stop];
@@ -215,15 +234,17 @@ function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
 
   for (var j = currentIdx + 1; j < stops.length; j++) {
     var stop = stops[j];
-    var isDest = (destId && (stop.extId === destId || stop.id === destId)) || nameMatches(stop.name, destName);
-    if (isDest) {
-      // Only use the real arrival field; if missing, return null (no fake fallback)
+    var matchedById = destId && (stop.extId === destId || stop.id === destId);
+    var matchedByName = !matchedById && nameMatches(stop.name, destName);
+    if (matchedById || matchedByName) {
       if (!stop.arrTime && !stop.rtArrTime) return null;
       return {
         name: preferredStationName(stop.name) || stop.name,
         time: stop.arrTime || null,
         rtTime: stop.rtArrTime || null,
-        matchedApiName: stop.name
+        matchedApiName: stop.name,
+        matchedExtId: stop.extId,
+        matchedById: !!matchedById
       };
     }
   }
@@ -325,20 +346,20 @@ app.get('/api/debug', async (req, res) => {
   try {
     const stopId = req.query.id || '740000003';
     const data = await fetchDeparturesCached(stopId);
-    const deps = (data.Departure || []).slice(0, 3);
+    const deps = (data.Departure || []).slice(0, 5);
     res.json({
       version: VERSION, stopId, count: deps.length,
       departures: deps.map(d => ({
         classified_as: getMode(d),
         detected_category: getTrainCategory(d),
         track: getTrack(d),
-        stops_count: (d.Stops && d.Stops.Stop) ? (Array.isArray(d.Stops.Stop) ? d.Stops.Stop.length : 1) : 0,
+        name: d.name, direction: d.direction,
+        time: d.time, rtTime: d.rtTime,
         all_stops: (d.Stops && d.Stops.Stop) ? (Array.isArray(d.Stops.Stop) ? d.Stops.Stop : [d.Stops.Stop]).map(s => ({
-          name: s.name, extId: s.extId, id: s.id,
+          name: s.name, extId: s.extId,
           arrTime: s.arrTime, rtArrTime: s.rtArrTime,
           depTime: s.depTime, rtDepTime: s.rtDepTime
-        })) : [],
-        raw: { name: d.name, type: d.type, direction: d.direction, track: d.track, rtTrack: d.rtTrack }
+        })) : []
       }))
     });
   } catch (e) {
@@ -350,6 +371,7 @@ app.get('/api/line-scan', async (req, res) => {
   try {
     const fromId = req.query.from;
     const toId = req.query.to;
+    const debug = req.query.debug === '1';
     if (!fromId || !toId) return res.status(400).json({ error: 'from and to required' });
 
     const fromStation = STATIONS.find(s => s.id === fromId);
@@ -420,14 +442,25 @@ app.get('/api/line-scan', async (req, res) => {
         .map(d => {
           const cat = getTrainCategory(d._raw);
           const arr = findTrainArrivalAtDest(d._raw, stop.id, stop.name, toStation.id, toStation.name);
-          return {
+          const out = {
             line: d.line, productName: d.productName, direction: d.direction,
             time: d.time, rtTime: d.rtTime, track: d.track, cancelled: d.cancelled,
             category: cat.name, categoryClass: cat.cls,
             arrTime: arr ? arr.time : null,
             rtArrTime: arr ? arr.rtTime : null,
-            arrAt: arr ? arr.name : null
+            arrAt: arr ? arr.name : null,
+            arrMatchedById: arr ? arr.matchedById : false,
+            arrMatchedApiName: arr ? arr.matchedApiName : null
           };
+          if (debug) {
+            out._passlist = (d._raw.Stops && d._raw.Stops.Stop)
+              ? (Array.isArray(d._raw.Stops.Stop) ? d._raw.Stops.Stop : [d._raw.Stops.Stop]).map(s => ({
+                  name: s.name, extId: s.extId, arrTime: s.arrTime, rtArrTime: s.rtArrTime,
+                  depTime: s.depTime, rtDepTime: s.rtDepTime
+                }))
+              : [];
+          }
+          return out;
         });
 
       results.push({
@@ -491,7 +524,6 @@ const HTML = `<!DOCTYPE html>
   .status-pill.err { background: rgba(255,77,77,0.12); color: #ff4d4d; border: 0.5px solid rgba(255,77,77,0.3); }
   .status-pill.warn { background: rgba(255,179,68,0.12); color: #ffb344; border: 0.5px solid rgba(255,179,68,0.3); }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
-
   .route-box { background: #1a1a1d; border-radius: 14px; padding: 14px; display: flex; align-items: center; gap: 8px; margin-bottom: 18px; border: 0.5px solid rgba(255,255,255,0.08); }
   .route-side { flex: 1; cursor: pointer; padding: 4px 6px; border-radius: 8px; }
   .route-side:hover, .route-side:active { background: rgba(255,255,255,0.04); }
@@ -501,23 +533,19 @@ const HTML = `<!DOCTYPE html>
   .swap-btn { width: 36px; height: 36px; border-radius: 50%; background: #2a2a2d; border: 0.5px solid rgba(255,255,255,0.1); color: #1fd67a; cursor: pointer; font-size: 18px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: transform 0.2s; }
   .swap-btn:hover { transform: rotate(180deg); }
   .swap-btn:active { background: #1fd67a; color: #0a0a0b; }
-
   .tabs { display: flex; gap: 4px; margin-bottom: 18px; background: #1a1a1d; padding: 4px; border-radius: 12px; }
   .tab { flex: 1; text-align: center; padding: 10px 0; font-size: 13px; color: #888; border-radius: 9px; cursor: pointer; font-weight: 500; }
   .tab.on { background: #2a2a2d; color: #f0f0f0; }
-
   .section-label { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin: 18px 0 8px; display: flex; justify-content: space-between; align-items: center; }
   .section-label:first-of-type { margin-top: 6px; }
   .badge { font-size: 9px; padding: 3px 8px; border-radius: 20px; letter-spacing: 0.5px; }
   .badge-trafiklab { background: rgba(31,214,122,0.15); color: #1fd67a; border: 0.5px solid rgba(31,214,122,0.25); }
   .badge-bus { background: rgba(255,179,68,0.15); color: #ffb344; border: 0.5px solid rgba(255,179,68,0.3); }
-
   .notice-banner { border-radius: 12px; padding: 12px 14px; font-size: 13px; line-height: 1.45; margin-bottom: 12px; display: flex; gap: 10px; align-items: flex-start; }
   .notice-banner.escape { background: rgba(31,214,122,0.08); border: 0.5px solid rgba(31,214,122,0.3); color: #1fd67a; }
   .notice-banner.warn { background: rgba(255,179,68,0.08); border: 0.5px solid rgba(255,179,68,0.3); color: #ffb344; }
   .notice-banner.err { background: rgba(255,77,77,0.08); border: 0.5px solid rgba(255,77,77,0.3); color: #ff8080; }
   .notice-icon { font-size: 14px; line-height: 1.45; flex-shrink: 0; }
-
   .line-scan { position: relative; padding-left: 24px; }
   .line-scan::before { content: ''; position: absolute; left: 9px; top: 12px; bottom: 12px; width: 2px; background: rgba(255,255,255,0.1); }
   .scan-station { position: relative; padding: 4px 0 18px; }
@@ -553,7 +581,6 @@ const HTML = `<!DOCTYPE html>
   .train-status.on-time { color: #1fd67a; }
   .train-status.delayed { color: #ffb344; }
   .train-status.cancelled { color: #ff4d4d; }
-
   .train-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 80px; }
   .train-time { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1; }
   .train-time.delayed { color: #ffb344; }
@@ -565,7 +592,6 @@ const HTML = `<!DOCTYPE html>
   .train-track { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; padding: 1px 6px; border: 0.5px solid rgba(255,255,255,0.15); border-radius: 4px; }
   .scan-empty { font-size: 12px; color: #666; padding: 8px 12px; font-style: italic; }
   .scan-destination { color: #1fd67a; font-size: 13px; padding: 4px 0; }
-
   .bus-section { background: #1a1a1d; border-radius: 12px; padding: 12px 14px; border: 0.5px solid rgba(255,179,68,0.25); margin-bottom: 10px; }
   .bus-section-head { font-size: 12px; font-weight: 600; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; color: #ffb344; }
   .bus-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-top: 0.5px solid rgba(255,255,255,0.05); gap: 10px; }
@@ -584,13 +610,11 @@ const HTML = `<!DOCTYPE html>
   .bus-arrival .arrow { color: #1fd67a; font-size: 9px; }
   .bus-arr-station { font-size: 10px; color: #1fd67a; font-weight: 500; line-height: 1.1; }
   .bus-track { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; padding: 1px 6px; border: 0.5px solid rgba(255,255,255,0.15); border-radius: 4px; }
-
   .empty, .loading { padding: 28px 16px; text-align: center; color: #666; font-size: 13px; }
   .err-box { background: rgba(255,77,77,0.08); border: 0.5px solid rgba(255,77,77,0.3); border-radius: 12px; padding: 16px; color: #ff8080; font-size: 13px; line-height: 1.5; }
   .refresh { width: 100%; background: #1a1a1d; color: #f0f0f0; border: 0.5px solid rgba(255,255,255,0.1); padding: 12px; border-radius: 12px; margin-top: 14px; cursor: pointer; font-size: 13px; font-weight: 500; }
   .refresh:hover { background: #2a2a2d; }
   .footer { text-align: center; color: #444; font-size: 10px; margin-top: 18px; letter-spacing: 0.3px; }
-
   .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(6px); display: none; align-items: flex-end; justify-content: center; z-index: 100; }
   .modal-bg.on { display: flex; }
   .modal { background: #1a1a1d; width: 100%; max-width: 440px; border-radius: 18px 18px 0 0; padding: 20px 16px 24px; max-height: 80vh; overflow-y: auto; border-top: 0.5px solid rgba(255,255,255,0.1); }
@@ -667,6 +691,8 @@ const HTML = `<!DOCTYPE html>
     to:   { id: '740000787', name: 'København H', country: 'DK' }
   };
   var pickerTarget = null;
+  var MAX_JOURNEY_MIN = 100;
+  var MAX_DELAY_VS_SCHEDULED = 60;
 
   try {
     var saved = localStorage.getItem('broalert-route');
@@ -727,6 +753,12 @@ const HTML = `<!DOCTYPE html>
 
   function fmtTime(t) { return t ? t.substring(0, 5) : '--:--'; }
   function parseToMin(t) { if (!t) return 0; var p = t.split(':'); return parseInt(p[0], 10) * 60 + parseInt(p[1], 10); }
+  function diffMin(from, to) {
+    var d = parseToMin(to) - parseToMin(from);
+    if (d < -720) d += 24 * 60;
+    if (d > 720) d -= 24 * 60;
+    return d;
+  }
   function delayMin(s, a) { var d = parseToMin(a) - parseToMin(s); if (d < -720) d += 24 * 60; return d; }
 
   function setStatus(level, text) {
@@ -747,20 +779,25 @@ const HTML = `<!DOCTYPE html>
     return '<div class="train-track">Spår ' + escapeHtml(track) + '</div>';
   }
 
-  // Sanity-check: anything > 210 minutes (3.5h) between departure and arrival on the Øresund corridor is bogus
-  function sanityCheckJourney(depTime, arrTime) {
-    if (!depTime || !arrTime) return false;
-    var dep = parseToMin(fmtTime(depTime));
-    var arr = parseToMin(fmtTime(arrTime));
-    var diff = arr - dep;
-    if (diff < 0) diff += 24 * 60;
-    return diff >= 0 && diff <= 210;
+  // Choose the most trustworthy arrival time:
+  // - If only one is present, use it.
+  // - If both exist but real-time is >60 min off scheduled, trust scheduled (real-time looks corrupted).
+  function chooseTrustedArrTime(arrTime, rtArrTime) {
+    if (!arrTime && !rtArrTime) return null;
+    if (!arrTime) return rtArrTime;
+    if (!rtArrTime) return arrTime;
+    var d = Math.abs(diffMin(fmtTime(arrTime), fmtTime(rtArrTime)));
+    if (d > MAX_DELAY_VS_SCHEDULED) return arrTime;
+    return rtArrTime;
   }
 
   function destArrivalBlock(arrTime, rtArrTime, cancelled, depTime, arrAt) {
-    if (cancelled || !arrTime || !arrAt) return '';
-    var arr = rtArrTime ? fmtTime(rtArrTime) : fmtTime(arrTime);
-    if (!sanityCheckJourney(depTime, arrTime)) return '';
+    if (cancelled || !arrAt) return '';
+    var chosen = chooseTrustedArrTime(arrTime, rtArrTime);
+    if (!chosen || !depTime) return '';
+    var journey = diffMin(fmtTime(depTime), fmtTime(chosen));
+    if (journey <= 0 || journey > MAX_JOURNEY_MIN) return '';
+    var arr = fmtTime(chosen);
     return '<div class="train-arrival"><span class="arrow">→</span>' + arr + '</div>' +
            '<div class="train-arr-station">' + escapeHtml(arrAt) + '</div>';
   }
@@ -803,7 +840,6 @@ const HTML = `<!DOCTYPE html>
       container.innerHTML = '<div class="err-box">Route between these stations is outside the supported Øresund corridor for now.</div>';
       return { totalStop: false, anyIssue: false, totalTrains: 0, firstWorkingIdx: -1, originOK: false, replacements: [] };
     }
-    // Surface the deployed version too
     var foot = document.getElementById('footer');
     if (foot && data.version) foot.textContent = 'BroAlert ' + data.version;
 
@@ -879,9 +915,12 @@ const HTML = `<!DOCTYPE html>
   }
 
   function busArrivalBlock(b) {
-    if (b.cancelled || !b.arrTime || !b.arrAt) return '';
-    if (!sanityCheckJourney(b.time, b.arrTime)) return '';
-    var arrT = b.rtArrTime ? fmtTime(b.rtArrTime) : fmtTime(b.arrTime);
+    if (b.cancelled || !b.arrAt) return '';
+    var chosen = chooseTrustedArrTime(b.arrTime, b.rtArrTime);
+    if (!chosen || !b.time) return '';
+    var journey = diffMin(fmtTime(b.time), fmtTime(chosen));
+    if (journey <= 0 || journey > MAX_JOURNEY_MIN) return '';
+    var arrT = fmtTime(chosen);
     return '<div class="bus-arrival"><span class="arrow">→</span>' + arrT + '</div>' +
            '<div class="bus-arr-station">' + escapeHtml(b.arrAt) + '</div>';
   }

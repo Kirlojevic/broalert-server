@@ -59,18 +59,15 @@ function getMode(dep) {
   var catCode = product.catCode;
   if (catCode !== undefined && catCode !== null) {
     catCode = parseInt(catCode, 10);
-    // Hafas convention: 0–4 are typically trains, 5/7 are buses
     if (!isNaN(catCode) && catCode >= 0 && catCode <= 4) return 'train';
     if (catCode === 5 || catCode === 7) return 'bus';
   }
-  // Type field fallback (Hafas types: JNY, ST, RE, RB, IC, ICE, IR, S = train; BUS = bus)
   var t = ((dep.type || '') + '').toUpperCase();
   if (['ST', 'RE', 'RB', 'IC', 'ICE', 'IR', 'S', 'JNY', 'EC', 'EN', 'NJ'].indexOf(t) >= 0) return 'train';
   if (['BUS', 'B'].indexOf(t) >= 0) return 'bus';
   return 'other';
 }
 
-// Build a single search blob from every plausible field on the departure
 function buildCategoryBlob(dep) {
   var product = dep.ProductAtStop || (dep.Product && dep.Product[0]) || dep.Product || {};
   var pieces = [];
@@ -81,7 +78,6 @@ function buildCategoryBlob(dep) {
     var v = product[fields[i]];
     if (v && (typeof v === 'string' || typeof v === 'number')) pieces.push(String(v));
   }
-  // Also include any sibling Product entries
   if (Array.isArray(dep.Product)) {
     for (var j = 0; j < dep.Product.length; j++) {
       var p2 = dep.Product[j];
@@ -107,8 +103,6 @@ function buildCategoryBlob(dep) {
 
 function getTrainCategory(dep) {
   var blob = buildCategoryBlob(dep);
-
-  // Direct brand mentions (most reliable)
   if (blob.indexOf('öresundståg') >= 0 || blob.indexOf('öresundstog') >= 0 ||
       blob.indexOf('oresundstag') >= 0 || blob.indexOf('oresundstog') >= 0 ||
       blob.indexOf('öresund') >= 0) return { name: 'Öresundståg', cls: 'oresundstog' };
@@ -117,25 +111,33 @@ function getTrainCategory(dep) {
   if (blob.indexOf('snäll') >= 0 || blob.indexOf('snall') >= 0) return { name: 'Snälltåget', cls: 'snall' };
   if (blob.indexOf('snabbtåg') >= 0 || blob.indexOf('snabbtag') >= 0) return { name: 'SJ Snabbtåg', cls: 'sj' };
   if (blob.indexOf('intercity') >= 0) return { name: 'IC', cls: 'ic' };
-
-  // Operator-based fallback (Pågatåg = Arriva; Öresundståg = Transdev/Veolia/DSBFirst)
   if (blob.indexOf('arriva') >= 0) return { name: 'Pågatåg', cls: 'pagatag' };
   if (blob.indexOf('transdev') >= 0 || blob.indexOf('veolia') >= 0 || blob.indexOf('dsbfirst') >= 0) return { name: 'Öresundståg', cls: 'oresundstog' };
   if (/(^|\s|-)sj(\s|$|-|ab)/.test(blob)) return { name: 'SJ', cls: 'sj' };
   if (blob.indexOf('dsb') >= 0) return { name: 'DSB', cls: 'dsb' };
   if (blob.indexOf('skånetrafiken') >= 0 || blob.indexOf('skanetrafiken') >= 0) return { name: 'Skånetrafiken', cls: 'pagatag' };
-
-  // Hafas type codes
   if (/(^|\s)re\s|(^|\s)re\d/.test(blob)) return { name: 'RE', cls: 'default' };
   if (/(^|\s)ic\s|(^|\s)ic\d/.test(blob)) return { name: 'IC', cls: 'ic' };
   if (/(^|\s)ir\s|(^|\s)ir\d/.test(blob)) return { name: 'IR', cls: 'default' };
-
   return { name: 'Tåg', cls: 'default' };
 }
 
 function isReplacementBus(dep) {
   var blob = buildCategoryBlob(dep) + ' ' + (dep.direction || '').toLowerCase();
   return /ersätt|replac|skenersätt|spårersätt|train replacement|rail replacement|tågbuss|tåg buss|togbus|tog buss|sj buss/i.test(blob);
+}
+
+function getTrack(dep) {
+  if (dep.rtTrack) return dep.rtTrack;
+  if (dep.track) return dep.track;
+  if (dep.Stops && dep.Stops.Stop) {
+    var stops = Array.isArray(dep.Stops.Stop) ? dep.Stops.Stop : [dep.Stops.Stop];
+    if (stops.length > 0) {
+      var first = stops[0];
+      return first.rtDepTrack || first.depTrack || first.rtTrack || first.track || null;
+    }
+  }
+  return null;
 }
 
 function normName(n) {
@@ -193,11 +195,9 @@ function headingInRightDirection(direction, currentStation, destStation) {
   if (dir === destStation) return true;
   var destN = normName(destStation);
   if (destN && normName(dir).endsWith(destN)) return true;
-
   var currPos = CORRIDOR_ORDER.indexOf(currentStation);
   var destPos = CORRIDOR_ORDER.indexOf(destStation);
   if (currPos === -1 || destPos === -1) return true;
-
   var goingNorth = destPos > currPos;
   var dirPos = CORRIDOR_ORDER.indexOf(dir);
   if (dirPos !== -1) {
@@ -229,6 +229,7 @@ function simplifyDeparture(dep) {
     direction: dep.direction || '',
     time: dep.time || '',
     rtTime: dep.rtTime || null,
+    track: getTrack(dep),
     cancelled: dep.cancelled === true || dep.Cancelled === 'true',
     mode: getMode(dep),
     isReplacement: isReplacementBus(dep),
@@ -238,26 +239,26 @@ function simplifyDeparture(dep) {
 
 app.get('/api/stations', (req, res) => res.json(STATIONS));
 
-// Debug endpoint: returns the raw first-3 departures so we can see what Trafiklab actually sends
 app.get('/api/debug', async (req, res) => {
   try {
     const stopId = req.query.id || '740000003';
     const data = await fetchDeparturesCached(stopId);
     const deps = (data.Departure || []).slice(0, 3);
-    const summary = deps.map(d => ({
-      classified_as: getMode(d),
-      detected_category: getTrainCategory(d),
-      category_blob: buildCategoryBlob(d),
-      raw: {
-        name: d.name,
-        type: d.type,
-        direction: d.direction,
-        ProductAtStop: d.ProductAtStop,
-        Product: d.Product,
-        Notes: d.Notes
-      }
-    }));
-    res.json({ stopId, count: deps.length, departures: summary });
+    res.json({
+      stopId,
+      count: deps.length,
+      departures: deps.map(d => ({
+        classified_as: getMode(d),
+        detected_category: getTrainCategory(d),
+        track: getTrack(d),
+        category_blob: buildCategoryBlob(d),
+        raw: {
+          name: d.name, type: d.type, direction: d.direction,
+          track: d.track, rtTrack: d.rtTrack,
+          ProductAtStop: d.ProductAtStop, Product: d.Product, Notes: d.Notes
+        }
+      }))
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -290,8 +291,30 @@ app.get('/api/line-scan', async (req, res) => {
       const isDestination = stop.name === toStation.name;
       const isOrigin = stop.name === fromStation.name;
 
+      // Always fetch — needed both for trains (intermediate stations) and replacement buses (any station)
+      let allDeps = [];
+      let fetchError = null;
+      try {
+        const data = await fetchDeparturesCached(stop.id);
+        allDeps = (data.Departure || []).map(simplifyDeparture);
+      } catch (e) {
+        fetchError = e.message;
+      }
+
+      // Collect replacement buses at this station (always, regardless of direction)
+      const replacementBuses = allDeps
+        .filter(d => d.mode === 'bus' && d.isReplacement)
+        .slice(0, 5)
+        .map(d => ({
+          line: d.line, direction: d.direction, time: d.time, rtTime: d.rtTime,
+          track: d.track, cancelled: d.cancelled
+        }));
+
       if (isDestination) {
-        results.push({ name: stop.name, country: stop.country, isDestination: true, trains: [] });
+        results.push({
+          name: stop.name, country: stop.country, isDestination: true,
+          trains: [], replacementBuses
+        });
         continue;
       }
 
@@ -299,32 +322,28 @@ app.get('/api/line-scan', async (req, res) => {
       const remainingIds = remaining.map(s => s.id);
       const remainingNames = remaining.map(s => s.name);
 
-      try {
-        const data = await fetchDeparturesCached(stop.id);
-        const allDeps = (data.Departure || []).map(simplifyDeparture);
+      const trains = allDeps
+        .filter(d => d.mode === 'train')
+        .filter(d => {
+          const adv = trainAdvancesTowardRoute(d._raw, stop.id, stop.name, remainingIds, remainingNames);
+          if (adv === true) return true;
+          if (adv === false) return false;
+          return headingInRightDirection(d.direction, stop.name, toStation.name);
+        })
+        .slice(0, 5)
+        .map(d => {
+          const cat = getTrainCategory(d._raw);
+          return {
+            line: d.line, productName: d.productName, direction: d.direction,
+            time: d.time, rtTime: d.rtTime, track: d.track, cancelled: d.cancelled,
+            category: cat.name, categoryClass: cat.cls
+          };
+        });
 
-        const trains = allDeps
-          .filter(d => d.mode === 'train')
-          .filter(d => {
-            const adv = trainAdvancesTowardRoute(d._raw, stop.id, stop.name, remainingIds, remainingNames);
-            if (adv === true) return true;
-            if (adv === false) return false;
-            return headingInRightDirection(d.direction, stop.name, toStation.name);
-          })
-          .slice(0, 5)
-          .map(d => {
-            const cat = getTrainCategory(d._raw);
-            return {
-              line: d.line, productName: d.productName, direction: d.direction,
-              time: d.time, rtTime: d.rtTime, cancelled: d.cancelled,
-              category: cat.name, categoryClass: cat.cls
-            };
-          });
-
-        results.push({ name: stop.name, country: stop.country, isOrigin, trains });
-      } catch (e) {
-        results.push({ name: stop.name, country: stop.country, isOrigin, error: e.message, trains: [] });
-      }
+      results.push({
+        name: stop.name, country: stop.country, isOrigin,
+        error: fetchError, trains, replacementBuses
+      });
     }
 
     res.json({ from: fromStation, to: toStation, supported: true, stations: results });
@@ -344,16 +363,13 @@ app.get('/api/buses', async (req, res) => {
 
     let buses = all.filter(d => d.mode === 'bus').map(d => ({
       line: d.line, productName: d.productName, direction: d.direction,
-      time: d.time, rtTime: d.rtTime, cancelled: d.cancelled,
+      time: d.time, rtTime: d.rtTime, track: d.track, cancelled: d.cancelled,
       isReplacement: d.isReplacement,
       endsAtDest: busEndsAtDestination(d.direction, destName)
     }));
-    buses = buses.filter(b => b.isReplacement || b.endsAtDest);
-    buses.sort((a, b) => {
-      if (a.isReplacement !== b.isReplacement) return a.isReplacement ? -1 : 1;
-      return (a.time || '').localeCompare(b.time || '');
-    });
-    res.json({ buses: buses.slice(0, 6) });
+    buses = buses.filter(b => b.endsAtDest && !b.isReplacement); // direct-to-destination only (replacements covered by line-scan)
+    buses.sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+    res.json({ buses: buses.slice(0, 5) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -397,7 +413,7 @@ const HTML = `<!DOCTYPE html>
   .section-label:first-of-type { margin-top: 6px; }
   .badge { font-size: 9px; padding: 3px 8px; border-radius: 20px; letter-spacing: 0.5px; }
   .badge-trafiklab { background: rgba(31,214,122,0.15); color: #1fd67a; border: 0.5px solid rgba(31,214,122,0.25); }
-  .badge-bus { background: rgba(77,158,255,0.15); color: #4d9eff; border: 0.5px solid rgba(77,158,255,0.25); }
+  .badge-bus { background: rgba(255,179,68,0.15); color: #ffb344; border: 0.5px solid rgba(255,179,68,0.3); }
 
   .notice-banner { border-radius: 12px; padding: 12px 14px; font-size: 13px; line-height: 1.45; margin-bottom: 12px; display: flex; gap: 10px; align-items: flex-start; }
   .notice-banner.escape { background: rgba(31,214,122,0.08); border: 0.5px solid rgba(31,214,122,0.3); color: #1fd67a; }
@@ -440,27 +456,31 @@ const HTML = `<!DOCTYPE html>
   .train-status.on-time { color: #1fd67a; }
   .train-status.delayed { color: #ffb344; }
   .train-status.cancelled { color: #ff4d4d; }
-  .train-time { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  .train-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+  .train-time { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .train-time.delayed { color: #ffb344; }
   .train-time.cancelled { color: #ff4d4d; text-decoration: line-through; }
   .train-time .orig { display: block; font-size: 10px; color: #666; text-decoration: line-through; font-weight: 400; text-align: right; }
+  .train-track { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; padding: 1px 6px; border: 0.5px solid rgba(255,255,255,0.15); border-radius: 4px; }
+  .train-track.empty { display: none; }
   .scan-empty { font-size: 12px; color: #666; padding: 8px 12px; font-style: italic; }
   .scan-destination { color: #1fd67a; font-size: 13px; padding: 4px 0; }
 
-  .bus-section { background: #1a1a1d; border-radius: 12px; padding: 12px 14px; border: 0.5px solid rgba(255,255,255,0.08); margin-bottom: 10px; }
-  .bus-section-head { font-size: 12px; font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
-  .bus-flag-mini { font-size: 10px; color: #888; font-weight: 400; }
-  .bus-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-top: 0.5px solid rgba(255,255,255,0.05); gap: 10px; }
-  .bus-row:first-of-type { border-top: none; }
+  .bus-section { background: #1a1a1d; border-radius: 12px; padding: 12px 14px; border: 0.5px solid rgba(255,179,68,0.25); margin-bottom: 10px; }
+  .bus-section-head { font-size: 12px; font-weight: 600; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; color: #ffb344; }
+  .bus-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-top: 0.5px solid rgba(255,255,255,0.05); gap: 10px; }
+  .bus-row:first-of-type { border-top: none; padding-top: 4px; }
   .bus-info { min-width: 0; flex: 1; }
-  .bus-line { font-size: 13px; font-weight: 500; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .bus-line { font-size: 13px; font-weight: 600; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
   .bus-tag { font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: 700; letter-spacing: 0.3px; }
   .bus-tag.replacement { background: #ffb344; color: #1a1a1d; }
   .bus-tag.toward { background: rgba(31,214,122,0.15); color: #1fd67a; border: 0.5px solid rgba(31,214,122,0.3); }
-  .bus-direction { font-size: 11px; color: #888; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .bus-time { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  .bus-route-line { font-size: 11px; color: #aaa; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bus-from { color: #ffb344; font-weight: 500; }
+  .bus-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+  .bus-time { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .bus-time.cancelled { color: #ff4d4d; text-decoration: line-through; }
-  .bus-empty { font-size: 12px; color: #666; padding: 6px 0; font-style: italic; }
+  .bus-track { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; padding: 1px 6px; border: 0.5px solid rgba(255,255,255,0.15); border-radius: 4px; }
 
   .empty, .loading { padding: 28px 16px; text-align: center; color: #666; font-size: 13px; }
   .err-box { background: rgba(255,77,77,0.08); border: 0.5px solid rgba(255,77,77,0.3); border-radius: 12px; padding: 16px; color: #ff8080; font-size: 13px; line-height: 1.5; }
@@ -616,6 +636,11 @@ const HTML = `<!DOCTYPE html>
     area.innerHTML = '<div class="notice-banner ' + level + '"><span class="notice-icon">' + icon + '</span><div>' + escapeHtml(text) + '</div></div>';
   }
 
+  function trackBadge(track) {
+    if (!track) return '';
+    return '<div class="train-track">Spår ' + escapeHtml(track) + '</div>';
+  }
+
   function renderTrainRow(train) {
     var time = fmtTime(train.time);
     var rt = train.rtTime ? fmtTime(train.rtTime) : null;
@@ -640,7 +665,10 @@ const HTML = `<!DOCTYPE html>
                '<div class="train-direction">→ ' + escapeHtml(train.direction || '') + '</div>' +
                '<div class="train-status ' + statusClass + '"><span class="sdot"></span>' + statusText + '</div>' +
              '</div>' +
-             '<div class="train-time ' + timeClass + '">' + timeHtml + '</div>' +
+             '<div class="train-right">' +
+               '<div class="train-time ' + timeClass + '">' + timeHtml + '</div>' +
+               trackBadge(train.track) +
+             '</div>' +
            '</div>';
   }
 
@@ -648,12 +676,12 @@ const HTML = `<!DOCTYPE html>
     var container = document.getElementById('scan-container');
     if (!data.supported) {
       container.innerHTML = '<div class="err-box">Route between these stations is outside the supported Øresund corridor for now.</div>';
-      return { totalStop: false, anyIssue: false, totalTrains: 0, firstWorkingIdx: -1, originOK: false };
+      return { totalStop: false, anyIssue: false, totalTrains: 0, firstWorkingIdx: -1, originOK: false, replacements: [] };
     }
     var stations = data.stations || [];
     if (stations.length === 0) {
       container.innerHTML = '<div class="empty">No stations to scan.</div>';
-      return { totalStop: false, anyIssue: false, totalTrains: 0, firstWorkingIdx: -1, originOK: false };
+      return { totalStop: false, anyIssue: false, totalTrains: 0, firstWorkingIdx: -1, originOK: false, replacements: [] };
     }
     var originIdx = -1;
     for (var oi = 0; oi < stations.length; oi++) if (stations[oi].isOrigin) { originIdx = oi; break; }
@@ -669,9 +697,19 @@ const HTML = `<!DOCTYPE html>
     }
     var html = '<div class="line-scan">';
     var anyIssue = false, totalTrains = 0, totalStop = true;
+    var replacements = [];
+
     for (var i = 0; i < stations.length; i++) {
       var st = stations[i];
       var trains = st.trains || [];
+
+      // Collect replacements from this station
+      if (st.replacementBuses && st.replacementBuses.length > 0) {
+        for (var ri = 0; ri < st.replacementBuses.length; ri++) {
+          replacements.push(Object.assign({}, st.replacementBuses[ri], { fromStation: st.name, fromCountry: st.country }));
+        }
+      }
+
       if (st.isDestination) {
         html += '<div class="scan-station destination">' +
                   '<div class="scan-station-head">' +
@@ -707,32 +745,75 @@ const HTML = `<!DOCTYPE html>
     }
     html += '</div>';
     container.innerHTML = html;
-    return { totalStop: totalStop, anyIssue: anyIssue, totalTrains: totalTrains, firstWorkingIdx: firstWorkingIdx, originOK: originOK, stations: stations };
+    return {
+      totalStop: totalStop, anyIssue: anyIssue, totalTrains: totalTrains,
+      firstWorkingIdx: firstWorkingIdx, originOK: originOK, stations: stations,
+      replacements: replacements
+    };
   }
 
-  function renderBusSection(label, country, buses, totalStop) {
-    var visible = (buses || []).filter(function(b) { return b.isReplacement || (totalStop && b.endsAtDest); });
-    if (visible.length === 0) return '';
-    var html = '<div class="bus-section"><div class="bus-section-head">' + escapeHtml(label) + ' <span class="bus-flag-mini">' + country + '</span></div>';
-    for (var i = 0; i < visible.length; i++) {
-      var b = visible[i];
-      var time = fmtTime(b.time);
-      var rt = b.rtTime ? fmtTime(b.rtTime) : null;
-      var timeDisplay = b.cancelled ? time : (rt || time);
-      var timeClass = b.cancelled ? 'cancelled' : '';
-      var tags = '';
-      if (b.isReplacement) tags += '<span class="bus-tag replacement">REPLACEMENT</span>';
-      else if (b.endsAtDest) tags += '<span class="bus-tag toward">TO ' + escapeHtml(state.to.name.toUpperCase()) + '</span>';
-      html += '<div class="bus-row">' +
-                '<div class="bus-info">' +
-                  '<div class="bus-line">' + tags + '<span>' + escapeHtml(b.line || 'Bus') + '</span></div>' +
-                  '<div class="bus-direction">→ ' + escapeHtml(b.direction || '') + '</div>' +
-                '</div>' +
-                '<div class="bus-time ' + timeClass + '">' + timeDisplay + '</div>' +
-              '</div>';
+  function renderBusSection(replacements, directToDest) {
+    var container = document.getElementById('bus-container');
+    var label = document.getElementById('bus-section-label');
+
+    if (replacements.length === 0 && directToDest.length === 0) {
+      container.innerHTML = '';
+      label.style.display = 'none';
+      return;
     }
-    html += '</div>';
-    return html;
+
+    label.style.display = 'flex';
+    var html = '';
+
+    if (replacements.length > 0) {
+      html += '<div class="bus-section"><div class="bus-section-head">Replacement buses (Tåg-bussar)</div>';
+      replacements.sort(function(a, b) { return (a.time || '').localeCompare(b.time || ''); });
+      for (var i = 0; i < replacements.length; i++) {
+        var b = replacements[i];
+        var time = fmtTime(b.time);
+        var rt = b.rtTime ? fmtTime(b.rtTime) : null;
+        var timeDisplay = b.cancelled ? time : (rt || time);
+        var timeClass = b.cancelled ? 'cancelled' : '';
+        var trackHtml = b.track ? '<div class="bus-track">Spår ' + escapeHtml(b.track) + '</div>' : '';
+        html += '<div class="bus-row">' +
+                  '<div class="bus-info">' +
+                    '<div class="bus-line"><span class="bus-tag replacement">REPLACEMENT</span><span>' + escapeHtml(b.line || 'Bus') + '</span></div>' +
+                    '<div class="bus-route-line"><span class="bus-from">from ' + escapeHtml(b.fromStation) + '</span> → ' + escapeHtml(b.direction || 'unknown') + '</div>' +
+                  '</div>' +
+                  '<div class="bus-right">' +
+                    '<div class="bus-time ' + timeClass + '">' + timeDisplay + '</div>' +
+                    trackHtml +
+                  '</div>' +
+                '</div>';
+      }
+      html += '</div>';
+    }
+
+    if (directToDest.length > 0) {
+      html += '<div class="bus-section"><div class="bus-section-head">Direct buses to ' + escapeHtml(state.to.name) + '</div>';
+      directToDest.sort(function(a, b) { return (a.time || '').localeCompare(b.time || ''); });
+      for (var k = 0; k < directToDest.length; k++) {
+        var d = directToDest[k];
+        var dtime = fmtTime(d.time);
+        var drt = d.rtTime ? fmtTime(d.rtTime) : null;
+        var dtimeDisplay = d.cancelled ? dtime : (drt || dtime);
+        var dtimeClass = d.cancelled ? 'cancelled' : '';
+        var dtrackHtml = d.track ? '<div class="bus-track">Spår ' + escapeHtml(d.track) + '</div>' : '';
+        html += '<div class="bus-row">' +
+                  '<div class="bus-info">' +
+                    '<div class="bus-line"><span class="bus-tag toward">TO ' + escapeHtml(state.to.name.toUpperCase()) + '</span><span>' + escapeHtml(d.line || 'Bus') + '</span></div>' +
+                    '<div class="bus-route-line"><span class="bus-from">from ' + escapeHtml(d.fromStation) + '</span> → ' + escapeHtml(d.direction || '') + '</div>' +
+                  '</div>' +
+                  '<div class="bus-right">' +
+                    '<div class="bus-time ' + dtimeClass + '">' + dtimeDisplay + '</div>' +
+                    dtrackHtml +
+                  '</div>' +
+                '</div>';
+      }
+      html += '</div>';
+    }
+
+    container.innerHTML = html;
   }
 
   async function loadEverything() {
@@ -743,11 +824,13 @@ const HTML = `<!DOCTYPE html>
     busContainer.innerHTML = '';
     busLabel.style.display = 'none';
     renderBanner(null, null);
+
     try {
       var scanRes = await fetch('/api/line-scan?from=' + state.from.id + '&to=' + state.to.id);
       var scanData = await scanRes.json();
       if (scanData.error) throw new Error(scanData.error);
       var summary = renderLineScan(scanData);
+
       if (!summary.originOK && summary.firstWorkingIdx > 0 && summary.stations) {
         var broken = [];
         for (var bi = 0; bi < summary.firstWorkingIdx; bi++) if (!summary.stations[bi].isDestination) broken.push(summary.stations[bi].name);
@@ -758,13 +841,22 @@ const HTML = `<!DOCTYPE html>
       } else if (state.from.country === 'DK' || state.to.country === 'DK') {
         renderBanner('warn', 'Danish-side coverage is limited until the Rejseplanen API is connected.');
       }
-      var fromBusReq = fetch('/api/buses?id=' + state.from.id + '&dest=' + encodeURIComponent(state.to.name));
-      var toBusReq = fetch('/api/buses?id=' + state.to.id + '&dest=' + encodeURIComponent(state.from.name));
-      var fromBusData = await (await fromBusReq).json();
-      var toBusData = await (await toBusReq).json();
-      var fromHtml = renderBusSection('Buses at ' + state.from.name, state.from.country, fromBusData.buses, summary.totalStop);
-      var toHtml = renderBusSection('Buses at ' + state.to.name, state.to.country, toBusData.buses, summary.totalStop);
-      if (fromHtml || toHtml) { busLabel.style.display = 'flex'; busContainer.innerHTML = fromHtml + toHtml; }
+
+      // Direct-to-destination buses only on total stop, queried at FROM and TO
+      var directToDest = [];
+      if (summary.totalStop) {
+        try {
+          var fromBusReq = await fetch('/api/buses?id=' + state.from.id + '&dest=' + encodeURIComponent(state.to.name));
+          var toBusReq = await fetch('/api/buses?id=' + state.to.id + '&dest=' + encodeURIComponent(state.from.name));
+          var fromBusData = await fromBusReq.json();
+          var toBusData = await toBusReq.json();
+          (fromBusData.buses || []).forEach(function(b) { directToDest.push(Object.assign({}, b, { fromStation: state.from.name })); });
+          (toBusData.buses || []).forEach(function(b) { directToDest.push(Object.assign({}, b, { fromStation: state.to.name })); });
+        } catch (e) {}
+      }
+
+      renderBusSection(summary.replacements, directToDest);
+
       if (summary.totalStop && summary.totalTrains > 0) setStatus('err', 'All cancelled');
       else if (!summary.originOK && summary.firstWorkingIdx > 0) setStatus('warn', 'Escape needed');
       else if (summary.anyIssue) setStatus('warn', 'Disruptions');

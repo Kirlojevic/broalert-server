@@ -2,25 +2,44 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 
-const VERSION = 'v24-diag-permissive-2026-05-16';
+const VERSION = 'v25-dynamic-station-ids-2026-05-16';
 
 app.use(cors());
 app.use(express.json());
 
 const RESROBOT = '6c964869-c6ab-4d2c-863e-5f9a8463cde0';
 
+// Hardcoded fallback IDs — these are verified against Trafiklab at startup.
+// If a wrong ID slips in (like 740098001 which was actually GÖTEBORG virtual stn),
+// the startup resolver will replace it.
 const STATIONS = [
-  { id: '740001586', name: 'Hyllie',           country: 'SE' },
-  { id: '740001587', name: 'Triangeln',        country: 'SE' },
-  { id: '740000003', name: 'Malmö C',          country: 'SE' },
-  { id: '740000120', name: 'Lund C',           country: 'SE' },
-  { id: '740098001', name: 'Helsingborg C',    country: 'SE' },
-  { id: '740000670', name: 'Kastrup Lufthavn', country: 'DK' },
-  { id: '740000787', name: 'København H',      country: 'DK' },
-  { id: '740000792', name: 'Nørreport',        country: 'DK' },
-  { id: '740000788', name: 'Ørestad',          country: 'DK' },
-  { id: '740000789', name: 'Tårnby',           country: 'DK' }
+  { id: '740001586', name: 'Hyllie',           country: 'SE', resolved: false },
+  { id: '740001587', name: 'Triangeln',        country: 'SE', resolved: false },
+  { id: '740000003', name: 'Malmö C',          country: 'SE', resolved: false },
+  { id: '740000120', name: 'Lund C',           country: 'SE', resolved: false },
+  { id: '740098001', name: 'Helsingborg C',    country: 'SE', resolved: false },
+  { id: '740000670', name: 'Kastrup Lufthavn', country: 'DK', resolved: false },
+  { id: '740000787', name: 'København H',      country: 'DK', resolved: false },
+  { id: '740000792', name: 'Nørreport',        country: 'DK', resolved: false },
+  { id: '740000788', name: 'Ørestad',          country: 'DK', resolved: false },
+  { id: '740000789', name: 'Tårnby',           country: 'DK', resolved: false }
 ];
+
+// Map from any previously-used IDs to current station names (for stale frontend state)
+const LEGACY_ID_MAP = { '740098001': 'Helsingborg C' };
+
+const SEARCH_TERMS = {
+  'Hyllie':           ['Malmö Hyllie', 'Hyllie'],
+  'Triangeln':        ['Malmö Triangeln', 'Triangeln'],
+  'Malmö C':          ['Malmö Centralstation'],
+  'Lund C':           ['Lund Centralstation'],
+  'Helsingborg C':    ['Helsingborg Centralstation', 'Helsingborg knutpunkten', 'Helsingborg C'],
+  'Kastrup Lufthavn': ['Københavns Lufthavn Kastrup', 'Kastrup Lufthavn', 'Copenhagen Airport'],
+  'København H':      ['København H', 'København Hovedbanegård', 'Copenhagen Central Station'],
+  'Nørreport':        ['København Nørreport', 'Nørreport'],
+  'Ørestad':          ['København Ørestad', 'Ørestad'],
+  'Tårnby':           ['Tårnby']
+};
 
 const CORRIDOR_ORDER = [
   'København H', 'Nørreport', 'Ørestad', 'Tårnby', 'Kastrup Lufthavn',
@@ -50,6 +69,108 @@ const FAR_SOUTH = ['København', 'Köpenhamn', 'Köpenhavn', 'Helsingør', 'Rosk
 const cache = new Map();
 const CACHE_TTL_MS = 90 * 1000;
 
+const resolutionLog = [];
+
+function extractLocationList(data) {
+  if (!data) return [];
+  if (data.StopLocation) return Array.isArray(data.StopLocation) ? data.StopLocation : [data.StopLocation];
+  if (data.stopLocationOrCoordLocation) {
+    var out = [];
+    for (var i = 0; i < data.stopLocationOrCoordLocation.length; i++) {
+      var item = data.stopLocationOrCoordLocation[i];
+      if (item.StopLocation) out.push(item.StopLocation);
+    }
+    return out;
+  }
+  return [];
+}
+
+async function lookupStop(query) {
+  const url = 'https://api.resrobot.se/v2.1/location.name?input=' + encodeURIComponent(query) +
+              '&format=json&accessId=' + RESROBOT;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const data = await r.json();
+  return extractLocationList(data);
+}
+
+function isAllCaps(s) {
+  if (!s || s.length < 3) return false;
+  return s === s.toUpperCase() && /[A-ZÅÄÖÆØ]/.test(s);
+}
+
+function chooseBestStopForStation(station, candidates) {
+  // Filter out all-caps virtual stations
+  const valid = candidates.filter(function(c) {
+    return c && c.id && c.name && !isAllCaps(c.name);
+  });
+  if (valid.length === 0) return null;
+  // Prefer stations where name contains the station's name keyword (e.g. "Helsingborg")
+  const keyword = station.name.replace(/ ?[CH]$/, '').toLowerCase();
+  valid.sort(function(a, b) {
+    const aHas = a.name.toLowerCase().indexOf(keyword) >= 0 ? 1 : 0;
+    const bHas = b.name.toLowerCase().indexOf(keyword) >= 0 ? 1 : 0;
+    if (aHas !== bHas) return bHas - aHas;
+    return (b.weight || 0) - (a.weight || 0);
+  });
+  return valid[0];
+}
+
+async function resolveOneStation(station) {
+  const terms = SEARCH_TERMS[station.name] || [station.name];
+  for (var i = 0; i < terms.length; i++) {
+    try {
+      var candidates = await lookupStop(terms[i]);
+      var best = chooseBestStopForStation(station, candidates);
+      if (best) {
+        var msg;
+        if (best.id !== station.id) {
+          msg = 'CHANGED ' + station.name + ': ' + station.id + ' → ' + best.id + ' (' + best.name + ')';
+          station.id = best.id;
+        } else {
+          msg = 'verified  ' + station.name + ' = ' + station.id + ' (' + best.name + ')';
+        }
+        station.resolved = true;
+        station.resolvedName = best.name;
+        resolutionLog.push(msg);
+        console.log(msg);
+        return;
+      }
+    } catch (e) {
+      console.log('Lookup failed for "' + terms[i] + '": ' + e.message);
+    }
+  }
+  var fmsg = 'UNRESOLVED ' + station.name + ' — keeping fallback ID ' + station.id;
+  resolutionLog.push(fmsg);
+  console.log(fmsg);
+}
+
+let resolutionPromise = null;
+function ensureStationsResolved() {
+  if (!resolutionPromise) {
+    resolutionPromise = (async function() {
+      for (var i = 0; i < STATIONS.length; i++) {
+        await resolveOneStation(STATIONS[i]);
+      }
+    })();
+  }
+  return resolutionPromise;
+}
+
+// Kick off resolution at startup (won't block requests but will complete quickly)
+ensureStationsResolved();
+
+function lookupStationByIdOrLegacy(id) {
+  var st = STATIONS.find(function(s) { return s.id === id; });
+  if (st) return st;
+  var name = LEGACY_ID_MAP[id];
+  if (name) {
+    st = STATIONS.find(function(s) { return s.name === name; });
+    if (st) return st;
+  }
+  return null;
+}
+
 async function fetchDeparturesCached(stopId) {
   const key = 'dep:' + stopId;
   const now = Date.now();
@@ -58,9 +179,7 @@ async function fetchDeparturesCached(stopId) {
   const url = 'https://api.resrobot.se/v2.1/departureBoard?id=' + stopId +
               '&maxJourneys=40&passlist=1&format=json&accessId=' + RESROBOT;
   const r = await fetch(url);
-  if (!r.ok) {
-    throw new Error('Trafiklab returned HTTP ' + r.status);
-  }
+  if (!r.ok) throw new Error('Trafiklab returned HTTP ' + r.status);
   const data = await r.json();
   cache.set(key, { data, time: now });
   return data;
@@ -167,9 +286,7 @@ function softNorm(s) {
   return v;
 }
 
-function normName(n) {
-  return softNorm(n).replace(/[\s\.\,;:()]/g, '');
-}
+function normName(n) { return softNorm(n).replace(/[\s\.\,;:()]/g, ''); }
 
 function nameWords(n) {
   if (!n) return [];
@@ -272,12 +389,10 @@ function trainDirectionPassesDest(direction, currentName, destName) {
   if (!direction || !currentName || !destName) return false;
   var dir = String(direction).trim();
   if (nameMatches(dir, destName)) return true;
-
   var currIdx = CORRIDOR_ORDER.indexOf(currentName);
   var destIdx = CORRIDOR_ORDER.indexOf(destName);
   if (currIdx === -1 || destIdx === -1) return false;
   var goingSouth = destIdx < currIdx;
-
   var dirIdx = -1;
   for (var k = 0; k < CORRIDOR_ORDER.length; k++) {
     if (nameMatches(dir, CORRIDOR_ORDER[k])) { dirIdx = k; break; }
@@ -286,7 +401,6 @@ function trainDirectionPassesDest(direction, currentName, destName) {
     if (goingSouth) return dirIdx <= destIdx;
     return dirIdx >= destIdx;
   }
-
   var dirSoft = softNorm(dir);
   var farList = goingSouth ? FAR_SOUTH : FAR_NORTH;
   for (var i = 0; i < farList.length; i++) {
@@ -300,7 +414,6 @@ function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
   var hasPasslist = dep.Stops && dep.Stops.Stop;
   var stops = hasPasslist ? (Array.isArray(dep.Stops.Stop) ? dep.Stops.Stop : [dep.Stops.Stop]) : [];
   trail.push('passlistLen=' + stops.length);
-
   var currentIdx = -1;
   for (var i = 0; i < stops.length; i++) {
     var s = stops[i];
@@ -309,16 +422,13 @@ function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
   }
   var foundCurrent = currentIdx >= 0;
   trail.push('foundCurrent=' + foundCurrent + (foundCurrent ? '@' + currentIdx : ''));
-
   var depTimeHere = null;
   if (foundCurrent && stops[currentIdx]) {
     depTimeHere = stops[currentIdx].rtDepTime || stops[currentIdx].depTime || null;
   }
   if (!depTimeHere) depTimeHere = dep.rtTime || dep.time || null;
   trail.push('depTimeHere=' + depTimeHere);
-
   if (!depTimeHere) return { arrival: null, debug: trail.concat(['noDepTime']) };
-
   var searchStart = foundCurrent ? currentIdx + 1 : 0;
   for (var j = searchStart; j < stops.length; j++) {
     var stop = stops[j];
@@ -328,8 +438,6 @@ function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
       var arrTime = stop.arrTime || null;
       var rtArrTime = stop.rtArrTime || null;
       var prefName = preferredStationName(stop.name) || stop.name || destName;
-      trail.push('destInPasslist@' + j + 'arr=' + arrTime + '/rt=' + rtArrTime);
-
       if ((arrTime || rtArrTime)) {
         var checkAgainst = rtArrTime || arrTime;
         var journey = diffMinSrv(depTimeHere, checkAgainst);
@@ -338,7 +446,6 @@ function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
         }
         trail.push('apiJourneyBad=' + journey);
       }
-
       var est = estimateCorridorMinutes(currentName, destName);
       if (est != null && est > 0) {
         return { arrival: { name: prefName, time: addMinutes(depTimeHere, est), rtTime: null, isEstimate: true, source: 'estimate-bad-time' }, debug: trail };
@@ -346,10 +453,7 @@ function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
       return { arrival: null, debug: trail.concat(['noEstAvail']) };
     }
   }
-  trail.push('destNotInPasslist');
-
   var dirPasses = trainDirectionPassesDest(dep.direction, currentName, destName);
-  trail.push('dirPasses=' + dirPasses);
   if (dirPasses) {
     var est2 = estimateCorridorMinutes(currentName, destName);
     if (est2 != null && est2 > 0) {
@@ -449,12 +553,29 @@ function simplifyDeparture(dep) {
   };
 }
 
-app.get('/api/version', (req, res) => res.json({ version: VERSION, timestamp: new Date().toISOString() }));
-app.get('/api/stations', (req, res) => res.json(STATIONS));
+app.get('/api/version', async (req, res) => {
+  await ensureStationsResolved();
+  res.json({
+    version: VERSION,
+    timestamp: new Date().toISOString(),
+    resolutionLog: resolutionLog.slice(),
+    stations: STATIONS.map(function(s) {
+      return { name: s.name, id: s.id, resolved: !!s.resolved, resolvedName: s.resolvedName || null };
+    })
+  });
+});
+
+app.get('/api/stations', async (req, res) => {
+  await ensureStationsResolved();
+  res.json(STATIONS.map(function(s) {
+    return { id: s.id, name: s.name, country: s.country };
+  }));
+});
 
 app.get('/api/debug', async (req, res) => {
+  await ensureStationsResolved();
   try {
-    const stopId = req.query.id || '740000003';
+    const stopId = req.query.id || STATIONS[2].id;
     const data = await fetchDeparturesCached(stopId);
     const deps = (data.Departure || []).slice(0, 10);
     res.json({
@@ -478,15 +599,16 @@ app.get('/api/debug', async (req, res) => {
 });
 
 app.get('/api/line-scan', async (req, res) => {
+  await ensureStationsResolved();
   try {
     const fromId = req.query.from;
     const toId = req.query.to;
     const debug = req.query.debug === '1';
     if (!fromId || !toId) return res.status(400).json({ error: 'from and to required' });
 
-    const fromStation = STATIONS.find(s => s.id === fromId);
-    const toStation = STATIONS.find(s => s.id === toId);
-    if (!fromStation || !toStation) return res.status(400).json({ error: 'unknown stations' });
+    const fromStation = lookupStationByIdOrLegacy(fromId);
+    const toStation = lookupStationByIdOrLegacy(toId);
+    if (!fromStation || !toStation) return res.status(400).json({ error: 'unknown stations (from=' + fromId + ', to=' + toId + ')' });
 
     const fromPos = CORRIDOR_ORDER.indexOf(fromStation.name);
     const toPos = CORRIDOR_ORDER.indexOf(toStation.name);
@@ -524,10 +646,8 @@ app.get('/api/line-scan', async (req, res) => {
           return {
             line: d.line, direction: d.direction, time: d.time, rtTime: d.rtTime,
             track: d.track, cancelled: d.cancelled,
-            arrTime: arr ? arr.time : null,
-            rtArrTime: arr ? arr.rtTime : null,
-            arrAt: arr ? arr.name : null,
-            arrIsEstimate: arr ? !!arr.isEstimate : false
+            arrTime: arr ? arr.time : null, rtArrTime: arr ? arr.rtTime : null,
+            arrAt: arr ? arr.name : null, arrIsEstimate: arr ? !!arr.isEstimate : false
           };
         });
 
@@ -535,7 +655,7 @@ app.get('/api/line-scan', async (req, res) => {
         results.push({
           name: stop.name, country: stop.country, isDestination: true,
           trains: [], replacementBuses,
-          diag: { rawCount, fetchError, trainsClassified: allDeps.filter(d => d.mode === 'train').length }
+          diag: { rawCount, fetchError, trainsClassified: allDeps.filter(d => d.mode === 'train').length, stationId: stop.id }
         });
         continue;
       }
@@ -546,16 +666,10 @@ app.get('/api/line-scan', async (req, res) => {
 
       const allTrains = allDeps.filter(d => d.mode === 'train');
 
-      // Permissive filter: accept if EITHER passlist confirms OR direction implies destination is reached
       const passingTrains = allTrains.filter(d => {
         const adv = trainAdvancesTowardRoute(d._raw, stop.id, stop.name, remainingIds, remainingNames);
         if (adv === true) return true;
-        if (adv === null) {
-          // No passlist — use direction
-          return headingInRightDirection(d.direction, stop.name, toStation.name);
-        }
-        // adv === false — passlist exists but didn't include any remaining station.
-        // Fall back to direction-based check (passlist data may be incomplete or use unfamiliar names)
+        if (adv === null) return headingInRightDirection(d.direction, stop.name, toStation.name);
         return trainDirectionPassesDest(d._raw.direction, stop.name, toStation.name);
       });
 
@@ -567,12 +681,9 @@ app.get('/api/line-scan', async (req, res) => {
           line: d.line, productName: d.productName, direction: d.direction,
           time: d.time, rtTime: d.rtTime, track: d.track, cancelled: d.cancelled,
           category: cat.name, categoryClass: cat.cls,
-          arrTime: arr ? arr.time : null,
-          rtArrTime: arr ? arr.rtTime : null,
-          arrAt: arr ? arr.name : null,
-          arrIsEstimate: arr ? !!arr.isEstimate : false,
-          arrSource: arr ? arr.source : null,
-          arrDebug: arrResult.debug.join(' | ')
+          arrTime: arr ? arr.time : null, rtArrTime: arr ? arr.rtTime : null,
+          arrAt: arr ? arr.name : null, arrIsEstimate: arr ? !!arr.isEstimate : false,
+          arrSource: arr ? arr.source : null, arrDebug: arrResult.debug.join(' | ')
         };
         if (debug) {
           out._passlist = (d._raw.Stops && d._raw.Stops.Stop)
@@ -585,7 +696,6 @@ app.get('/api/line-scan', async (req, res) => {
         return out;
       });
 
-      // Sample directions from rejected trains for diagnostics
       const rejectedDirections = [];
       const rejected = allTrains.filter(d => !passingTrains.includes(d));
       for (let r = 0; r < Math.min(rejected.length, 6); r++) {
@@ -596,11 +706,11 @@ app.get('/api/line-scan', async (req, res) => {
         name: stop.name, country: stop.country, isOrigin,
         error: fetchError, trains, replacementBuses,
         diag: {
-          rawCount,
-          fetchError,
+          rawCount, fetchError,
           trainsClassified: allTrains.length,
           trainsAfterFilter: passingTrains.length,
-          rejectedSample: rejectedDirections
+          rejectedSample: rejectedDirections,
+          stationId: stop.id
         }
       });
     }
@@ -612,6 +722,7 @@ app.get('/api/line-scan', async (req, res) => {
 });
 
 app.get('/api/buses', async (req, res) => {
+  await ensureStationsResolved();
   try {
     const stopId = req.query.id;
     const destName = req.query.dest;
@@ -628,10 +739,8 @@ app.get('/api/buses', async (req, res) => {
         time: d.time, rtTime: d.rtTime, track: d.track, cancelled: d.cancelled,
         isReplacement: d.isReplacement,
         endsAtDest: busEndsAtDestination(d.direction, destName),
-        arrTime: arr ? arr.time : null,
-        rtArrTime: arr ? arr.rtTime : null,
-        arrAt: arr ? arr.name : null,
-        arrIsEstimate: arr ? !!arr.isEstimate : false
+        arrTime: arr ? arr.time : null, rtArrTime: arr ? arr.rtTime : null,
+        arrAt: arr ? arr.name : null, arrIsEstimate: arr ? !!arr.isEstimate : false
       };
     });
     buses = buses.filter(b => b.endsAtDest && !b.isReplacement);
@@ -864,8 +973,23 @@ const HTML = `<!DOCTYPE html>
     document.getElementById('to-flag').textContent = state.to.country;
   }
 
+  function reconcileState() {
+    // After STATIONS loads, replace state.from / state.to with the freshest copy (by name match)
+    // This auto-heals stale localStorage IDs (e.g. old wrong Helsingborg ID 740098001)
+    ['from', 'to'].forEach(function(side) {
+      var st = STATIONS.find(function(s) { return s.name === state[side].name; });
+      if (st) state[side] = { id: st.id, name: st.name, country: st.country };
+    });
+    saveRoute();
+  }
+
   async function loadStations() {
-    try { var res = await fetch('/api/stations'); STATIONS = await res.json(); } catch (e) {}
+    try {
+      var res = await fetch('/api/stations');
+      STATIONS = await res.json();
+      reconcileState();
+      renderRoute();
+    } catch (e) {}
   }
 
   function openPicker(target) {
@@ -963,18 +1087,15 @@ const HTML = `<!DOCTYPE html>
     var delay = (rt && rt !== time) ? delayMin(time, rt) : 0;
     var cancelled = train.cancelled;
     var isDelayed = !cancelled && delay > 0;
-
     var statusClass, statusText;
     if (cancelled) { statusClass = 'cancelled'; statusText = 'Cancelled'; }
     else if (isDelayed) { statusClass = 'delayed'; statusText = 'Delayed ' + delay + ' min'; }
     else { statusClass = 'on-time'; statusText = 'On time'; }
-
     var timeClass = cancelled ? 'cancelled' : (isDelayed ? 'delayed' : '');
     var timeHtml = cancelled ? time : (isDelayed ? '<span class="orig">' + time + '</span>' + rt : time);
     var cardClass = cancelled ? ' cancelled' : (isDelayed ? ' delayed' : '');
     var catClass = train.categoryClass || 'default';
     var catName = train.category || 'Tåg';
-
     return '<div class="scan-train' + cardClass + '">' +
              '<div class="train-info">' +
                '<div class="train-line"><span class="train-cat ' + catClass + '">' + catName.toUpperCase() + '</span><span>' + escapeHtml(train.line || '') + '</span></div>' +
@@ -991,10 +1112,11 @@ const HTML = `<!DOCTYPE html>
 
   function renderDiag(diag) {
     if (!diag) return '';
-    var lines = [];
     if (diag.fetchError) {
       return '<div class="station-diag station-diag-err"><div class="station-diag-title">⚠ Trafiklab fetch failed</div>' + escapeHtml(diag.fetchError) + '</div>';
     }
+    var lines = [];
+    lines.push('Station ID used: <code>' + (diag.stationId || '?') + '</code>');
     lines.push('Trafiklab returned <code>' + diag.rawCount + '</code> departures · <code>' + diag.trainsClassified + '</code> classified as trains · <code>' + (diag.trainsAfterFilter || 0) + '</code> match this route');
     if (diag.rejectedSample && diag.rejectedSample.length > 0) {
       lines.push('Rejected sample: ' + diag.rejectedSample.map(escapeHtml).join(' · '));
@@ -1015,7 +1137,6 @@ const HTML = `<!DOCTYPE html>
       if (foot) foot.textContent = 'BroAlert ' + data.version;
       if (vTag) vTag.textContent = data.version;
     }
-
     var stations = data.stations || [];
     if (stations.length === 0) {
       container.innerHTML = '<div class="empty">No stations to scan.</div>';
@@ -1037,7 +1158,6 @@ const HTML = `<!DOCTYPE html>
     var html = '<div class="line-scan">';
     var anyIssue = false, totalTrains = 0, totalStop = true;
     var replacements = [];
-
     for (var i = 0; i < stations.length; i++) {
       var st = stations[i];
       var trains = st.trains || [];
@@ -1178,8 +1298,6 @@ const HTML = `<!DOCTYPE html>
       var scanData = await scanRes.json();
       if (scanData.error) throw new Error(scanData.error);
       var summary = renderLineScan(scanData);
-
-      // Smarter banner wording
       if (!summary.originOK && summary.firstWorkingIdx > 0 && summary.stations) {
         var origin = summary.stations[0];
         var escapeStation = summary.stations[summary.firstWorkingIdx].name;
@@ -1193,7 +1311,6 @@ const HTML = `<!DOCTYPE html>
       } else if (state.from.country === 'DK' || state.to.country === 'DK') {
         renderBanner('warn', 'Danish-side coverage is limited until the Rejseplanen API is connected.');
       }
-
       var directToDest = [];
       if (summary.totalStop) {
         try {

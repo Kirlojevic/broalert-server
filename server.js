@@ -140,29 +140,65 @@ function getTrack(dep) {
   return null;
 }
 
+// Normalize a station name for comparison: strip generic words, unify spellings
 function normName(n) {
-  return (n || '').toLowerCase()
-    .replace(/centralstation/g, 'c')
-    .replace(/centralen/g, 'c')
-    .replace(/central/g, 'c')
-    .replace(/[\s\.\,;:]/g, '');
+  if (!n) return '';
+  var s = String(n).toLowerCase();
+  s = s.replace(/\([^)]*\)/g, ' ');
+  s = s.replace(/centralstation/g, 'c').replace(/centralen/g, 'c').replace(/central/g, 'c');
+  s = s.replace(/köpenhamn|copenhagen|köpenhavn/g, 'københavn');
+  s = s.replace(/lufthavnen/g, 'lufthavn');
+  s = s.replace(/[\s\.\,;:()]/g, '');
+  return s;
 }
+
+// Split into clean lowercase words with possessive 's' stripped
+function nameWords(n) {
+  if (!n) return [];
+  var s = String(n).toLowerCase().replace(/\([^)]*\)/g, ' ');
+  return s.split(/[\s\.\,;:]+/).filter(Boolean).map(function(w) {
+    // Strip trailing Swedish possessive s on words ≥4 chars (preserves "buss", "bus", "ts" type words by length)
+    if (w.length >= 5 && w[w.length - 1] === 's') return w.slice(0, -1);
+    return w;
+  });
+}
+
+var GENERIC_WORDS = ['c', 'central', 'centralen', 'centralstation', 'station', 'st', 'h',
+                     'lufthavn', 'lufthavnen', 'airport', 'tog', 'banegård', 'banegard',
+                     'knutpunkt', 'knutpunkten'];
 
 function nameMatches(stopName, target) {
   if (!stopName || !target) return false;
   var sn = normName(stopName);
   var tn = normName(target);
-  return sn === tn || sn.endsWith(tn) || tn.endsWith(sn);
+  if (!sn || !tn) return false;
+  if (sn === tn) return true;
+  if (tn.length >= 4 && sn.indexOf(tn) >= 0) return true;
+  if (sn.length >= 4 && tn.indexOf(sn) >= 0) return true;
+
+  // Word-based: all distinctive target words must appear among stop words
+  var sWords = nameWords(stopName);
+  var tWords = nameWords(target);
+  function distinctive(w) { return GENERIC_WORDS.indexOf(w) < 0 && w.length >= 3; }
+  var sCore = sWords.filter(distinctive);
+  var tCore = tWords.filter(distinctive);
+  if (tCore.length === 0) return false;
+  for (var i = 0; i < tCore.length; i++) {
+    var found = false;
+    for (var j = 0; j < sCore.length; j++) {
+      if (sCore[j] === tCore[i]) { found = true; break; }
+    }
+    if (!found) return false;
+  }
+  return true;
 }
 
-// Find the arrival info for a train, preferring user's final destination if reached,
-// otherwise the furthest useful stop on the route.
-function findTrainArrival(dep, currentId, currentName, usefulIds, usefulNames, destId, destName) {
+// STRICT: arrival is shown only when the train actually reaches the user's chosen destination.
+function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
   if (!dep.Stops || !dep.Stops.Stop) return null;
   var stops = Array.isArray(dep.Stops.Stop) ? dep.Stops.Stop : [dep.Stops.Stop];
   if (stops.length === 0) return null;
 
-  // Find current station index
   var currentIdx = -1;
   for (var i = 0; i < stops.length; i++) {
     var s = stops[i];
@@ -171,51 +207,33 @@ function findTrainArrival(dep, currentId, currentName, usefulIds, usefulNames, d
   }
   if (currentIdx < 0) currentIdx = 0;
 
-  var destMatch = null;
-  var furthestUseful = null;
-
   for (var j = currentIdx + 1; j < stops.length; j++) {
     var stop = stops[j];
-
-    // Match user's final destination?
-    var isDest = false;
-    if (destId && (stop.extId === destId || stop.id === destId)) isDest = true;
-    else if (nameMatches(stop.name, destName)) isDest = true;
-    if (isDest) destMatch = stop;
-
-    // Match any useful stop on the route?
-    var isUseful = false;
-    if (usefulIds) {
-      for (var u = 0; u < usefulIds.length; u++) {
-        if (stop.extId === usefulIds[u] || stop.id === usefulIds[u]) { isUseful = true; break; }
-      }
+    var isDest = (destId && (stop.extId === destId || stop.id === destId)) || nameMatches(stop.name, destName);
+    if (isDest) {
+      return {
+        name: stop.name,
+        time: stop.arrTime || stop.depTime || null,
+        rtTime: stop.rtArrTime || stop.rtDepTime || null
+      };
     }
-    if (!isUseful && usefulNames) {
-      for (var n = 0; n < usefulNames.length; n++) {
-        if (nameMatches(stop.name, usefulNames[n])) { isUseful = true; break; }
-      }
-    }
-    if (isUseful) furthestUseful = stop;
   }
-
-  var chosen = destMatch || furthestUseful;
-  if (!chosen) return null;
-  return {
-    name: chosen.name,
-    time: chosen.arrTime || chosen.depTime || null,
-    rtTime: chosen.rtArrTime || chosen.rtDepTime || null,
-    isFinal: !!destMatch
-  };
+  return null;
 }
 
-// For buses, return arrival at the terminus (final stop)
-function findBusArrival(dep) {
+// STRICT: bus arrival is shown only when its terminus matches the user's chosen destination.
+function findBusArrivalAtDest(dep, destId, destName) {
   if (!dep.Stops || !dep.Stops.Stop) return null;
   var stops = Array.isArray(dep.Stops.Stop) ? dep.Stops.Stop : [dep.Stops.Stop];
   if (stops.length === 0) return null;
   var last = stops[stops.length - 1];
+  var matches = (destId && (last.extId === destId || last.id === destId)) || nameMatches(last.name, destName);
+  if (!matches) {
+    // Also check the direction string as a fallback (some buses have minimal passlist)
+    if (!nameMatches(dep.direction, destName)) return null;
+  }
   return {
-    name: last.name,
+    name: last.name || dep.direction,
     time: last.arrTime || last.depTime || null,
     rtTime: last.rtArrTime || last.rtDepTime || null
   };
@@ -275,12 +293,7 @@ function headingInRightDirection(direction, currentStation, destStation) {
 
 function busEndsAtDestination(direction, destName) {
   if (!direction || !destName) return false;
-  var dirN = normName(direction);
-  var destN = normName(destName);
-  if (!dirN || !destN) return false;
-  var destPrefix = destN.replace(/[ch]$/, '');
-  if (destPrefix.length < 3) destPrefix = destN;
-  return dirN.indexOf(destPrefix) >= 0;
+  return nameMatches(direction, destName);
 }
 
 function simplifyDeparture(dep) {
@@ -367,7 +380,7 @@ app.get('/api/line-scan', async (req, res) => {
         .filter(d => d.mode === 'bus' && d.isReplacement)
         .slice(0, 5)
         .map(d => {
-          const arr = findBusArrival(d._raw);
+          const arr = findBusArrivalAtDest(d._raw, toStation.id, toStation.name);
           return {
             line: d.line, direction: d.direction, time: d.time, rtTime: d.rtTime,
             track: d.track, cancelled: d.cancelled,
@@ -400,15 +413,14 @@ app.get('/api/line-scan', async (req, res) => {
         .slice(0, 5)
         .map(d => {
           const cat = getTrainCategory(d._raw);
-          const arr = findTrainArrival(d._raw, stop.id, stop.name, remainingIds, remainingNames, toStation.id, toStation.name);
+          const arr = findTrainArrivalAtDest(d._raw, stop.id, stop.name, toStation.id, toStation.name);
           return {
             line: d.line, productName: d.productName, direction: d.direction,
             time: d.time, rtTime: d.rtTime, track: d.track, cancelled: d.cancelled,
             category: cat.name, categoryClass: cat.cls,
             arrTime: arr ? arr.time : null,
             rtArrTime: arr ? arr.rtTime : null,
-            arrAt: arr ? arr.name : null,
-            arrIsFinal: arr ? arr.isFinal : false
+            arrAt: arr ? arr.name : null
           };
         });
 
@@ -428,13 +440,14 @@ app.get('/api/buses', async (req, res) => {
   try {
     const stopId = req.query.id;
     const destName = req.query.dest;
+    const destId = req.query.destId;
     if (!stopId) return res.status(400).json({ error: 'station id required' });
 
     const data = await fetchDeparturesCached(stopId);
     const all = (data.Departure || []).map(simplifyDeparture);
 
     let buses = all.filter(d => d.mode === 'bus').map(d => {
-      const arr = findBusArrival(d._raw);
+      const arr = findBusArrivalAtDest(d._raw, destId, destName);
       return {
         line: d.line, productName: d.productName, direction: d.direction,
         time: d.time, rtTime: d.rtTime, track: d.track, cancelled: d.cancelled,
@@ -535,16 +548,13 @@ const HTML = `<!DOCTYPE html>
   .train-status.delayed { color: #ffb344; }
   .train-status.cancelled { color: #ff4d4d; }
 
-  .train-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 80px; }
+  .train-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 78px; }
   .train-time { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1; }
   .train-time.delayed { color: #ffb344; }
   .train-time.cancelled { color: #ff4d4d; text-decoration: line-through; }
   .train-time .orig { display: block; font-size: 10px; color: #666; text-decoration: line-through; font-weight: 400; }
-  .train-arrival { font-size: 11px; font-variant-numeric: tabular-nums; line-height: 1.2; color: #aaa; display: flex; align-items: center; gap: 3px; }
-  .train-arrival .arrow { color: #555; font-size: 9px; }
-  .train-arrival.final { color: #1fd67a; font-weight: 600; }
-  .train-arr-station { font-size: 10px; color: #888; line-height: 1; }
-  .train-arr-station.final { color: #1fd67a; font-weight: 500; }
+  .train-arrival { font-size: 11px; font-variant-numeric: tabular-nums; line-height: 1.2; color: #1fd67a; font-weight: 600; display: flex; align-items: center; gap: 3px; }
+  .train-arrival .arrow { color: #1fd67a; font-size: 9px; }
   .train-track { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; padding: 1px 6px; border: 0.5px solid rgba(255,255,255,0.15); border-radius: 4px; }
   .scan-empty { font-size: 12px; color: #666; padding: 8px 12px; font-style: italic; }
   .scan-destination { color: #1fd67a; font-size: 13px; padding: 4px 0; }
@@ -560,11 +570,11 @@ const HTML = `<!DOCTYPE html>
   .bus-tag.toward { background: rgba(31,214,122,0.15); color: #1fd67a; border: 0.5px solid rgba(31,214,122,0.3); }
   .bus-route-line { font-size: 11px; color: #aaa; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .bus-from { color: #ffb344; font-weight: 500; }
-  .bus-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 80px; }
+  .bus-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 78px; }
   .bus-time { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1; }
   .bus-time.cancelled { color: #ff4d4d; text-decoration: line-through; }
-  .bus-arrival { font-size: 11px; font-variant-numeric: tabular-nums; color: #aaa; line-height: 1.2; display: flex; align-items: center; gap: 3px; }
-  .bus-arrival .arrow { color: #555; font-size: 9px; }
+  .bus-arrival { font-size: 11px; font-variant-numeric: tabular-nums; color: #1fd67a; font-weight: 600; line-height: 1.2; display: flex; align-items: center; gap: 3px; }
+  .bus-arrival .arrow { color: #1fd67a; font-size: 9px; }
   .bus-track { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; padding: 1px 6px; border: 0.5px solid rgba(255,255,255,0.15); border-radius: 4px; }
 
   .empty, .loading { padding: 28px 16px; text-align: center; color: #666; font-size: 13px; }
@@ -726,6 +736,12 @@ const HTML = `<!DOCTYPE html>
     return '<div class="train-track">Spår ' + escapeHtml(track) + '</div>';
   }
 
+  function destArrivalBlock(arrTime, rtArrTime, cancelled) {
+    if (cancelled || !arrTime) return '';
+    var arr = rtArrTime ? fmtTime(rtArrTime) : fmtTime(arrTime);
+    return '<div class="train-arrival"><span class="arrow">→</span>' + arr + '</div>';
+  }
+
   function renderTrainRow(train) {
     var time = fmtTime(train.time);
     var rt = train.rtTime ? fmtTime(train.rtTime) : null;
@@ -744,15 +760,6 @@ const HTML = `<!DOCTYPE html>
     var catClass = train.categoryClass || 'default';
     var catName = train.category || 'Tåg';
 
-    // Arrival block
-    var arrHtml = '';
-    if (!cancelled && train.arrTime) {
-      var arrT = train.rtArrTime ? fmtTime(train.rtArrTime) : fmtTime(train.arrTime);
-      var arrCls = train.arrIsFinal ? ' final' : '';
-      arrHtml = '<div class="train-arrival' + arrCls + '"><span class="arrow">→</span>' + arrT + '</div>' +
-                '<div class="train-arr-station' + arrCls + '">' + escapeHtml(train.arrAt || '') + '</div>';
-    }
-
     return '<div class="scan-train' + cardClass + '">' +
              '<div class="train-info">' +
                '<div class="train-line"><span class="train-cat ' + catClass + '">' + catName.toUpperCase() + '</span><span>' + escapeHtml(train.line || '') + '</span></div>' +
@@ -761,7 +768,7 @@ const HTML = `<!DOCTYPE html>
              '</div>' +
              '<div class="train-right">' +
                '<div class="train-time ' + timeClass + '">' + timeHtml + '</div>' +
-               arrHtml +
+               destArrivalBlock(train.arrTime, train.rtArrTime, cancelled) +
                trackBadge(train.track) +
              '</div>' +
            '</div>';
@@ -938,8 +945,8 @@ const HTML = `<!DOCTYPE html>
       var directToDest = [];
       if (summary.totalStop) {
         try {
-          var fromBusReq = await fetch('/api/buses?id=' + state.from.id + '&dest=' + encodeURIComponent(state.to.name));
-          var toBusReq = await fetch('/api/buses?id=' + state.to.id + '&dest=' + encodeURIComponent(state.from.name));
+          var fromBusReq = await fetch('/api/buses?id=' + state.from.id + '&destId=' + state.to.id + '&dest=' + encodeURIComponent(state.to.name));
+          var toBusReq = await fetch('/api/buses?id=' + state.to.id + '&destId=' + state.from.id + '&dest=' + encodeURIComponent(state.from.name));
           var fromBusData = await fromBusReq.json();
           var toBusData = await toBusReq.json();
           (fromBusData.buses || []).forEach(function(b) { directToDest.push(Object.assign({}, b, { fromStation: state.from.name })); });

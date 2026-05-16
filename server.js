@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 
-const VERSION = 'v20-strict-arrival-2026-05-16';
+const VERSION = 'v21-corridor-estimate-2026-05-16';
 
 app.use(cors());
 app.use(express.json());
@@ -26,6 +26,21 @@ const CORRIDOR_ORDER = [
   'København H', 'Nørreport', 'Ørestad', 'Tårnby', 'Kastrup Lufthavn',
   'Hyllie', 'Triangeln', 'Malmö C', 'Lund C', 'Helsingborg C'
 ];
+
+// Typical journey time between adjacent corridor stations (Öresundståg-class service).
+// Used as a fallback when Trafiklab's passlist arrival data is missing or implausible
+// (common for cross-border trains until Rejseplanen API is added).
+const CORRIDOR_LEG_MINUTES = {
+  'København H|Nørreport': 3,
+  'Nørreport|Ørestad': 6,
+  'Ørestad|Tårnby': 4,
+  'Tårnby|Kastrup Lufthavn': 3,
+  'Kastrup Lufthavn|Hyllie': 12,
+  'Hyllie|Triangeln': 4,
+  'Triangeln|Malmö C': 4,
+  'Malmö C|Lund C': 13,
+  'Lund C|Helsingborg C': 38
+};
 
 const FAR_NORTH = ['Helsingborg', 'Göteborg', 'Halmstad', 'Karlskrona', 'Kalmar', 'Hässleholm',
                    'Kristianstad', 'Ängelholm', 'Landskrona', 'Stockholm', 'Hallsberg',
@@ -167,7 +182,6 @@ var GENERIC_WORDS = ['c', 'central', 'centralen', 'centralstation', 'station', '
 
 function isWordChar(c) { return /[a-zåäöæøéè]/i.test(c); }
 
-// Returns true if `needle` appears as a whole word within `haystack`
 function wordBoundaryContains(haystack, needle) {
   if (!haystack || !needle || needle.length < 3) return false;
   var idx = haystack.indexOf(needle);
@@ -186,14 +200,10 @@ function nameMatches(stopName, target) {
   var tn = normName(target);
   if (!sn || !tn) return false;
   if (sn === tn) return true;
-
-  // Word-boundary substring match — prevents "Hyllie" matching "Hyllievången"
   var stopL = String(stopName).toLowerCase().replace(/\([^)]*\)/g, ' ');
   var targetL = String(target).toLowerCase().replace(/\([^)]*\)/g, ' ');
   if (wordBoundaryContains(stopL, targetL)) return true;
   if (wordBoundaryContains(targetL, stopL)) return true;
-
-  // Word-based matching for possessive-s / generic-suffix variants ("Lunds C" vs "Lund C")
   var sWords = nameWords(stopName);
   var tWords = nameWords(target);
   function distinctive(w) { return GENERIC_WORDS.indexOf(w) < 0 && w.length >= 3; }
@@ -218,7 +228,48 @@ function preferredStationName(apiName) {
   return apiName;
 }
 
-// STRICT: only the user's chosen destination, only real arrTime field
+// Time math helpers
+function parseToMinSrv(t) {
+  if (!t) return 0;
+  var p = String(t).split(':');
+  return parseInt(p[0], 10) * 60 + parseInt(p[1], 10);
+}
+function diffMinSrv(from, to) {
+  var d = parseToMinSrv(to) - parseToMinSrv(from);
+  if (d < -720) d += 24 * 60;
+  if (d > 720) d -= 24 * 60;
+  return d;
+}
+function addMinutes(timeStr, mins) {
+  var p = String(timeStr).split(':');
+  var total = parseInt(p[0], 10) * 60 + parseInt(p[1], 10) + mins;
+  total = ((total % 1440) + 1440) % 1440;
+  var hh = Math.floor(total / 60);
+  var mm = total % 60;
+  return (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm + ':00';
+}
+
+function estimateCorridorMinutes(fromName, toName) {
+  var fromIdx = CORRIDOR_ORDER.indexOf(fromName);
+  var toIdx = CORRIDOR_ORDER.indexOf(toName);
+  if (fromIdx === -1 || toIdx === -1) return null;
+  if (fromIdx === toIdx) return 0;
+  var startIdx = Math.min(fromIdx, toIdx);
+  var endIdx = Math.max(fromIdx, toIdx);
+  var total = 0;
+  for (var i = startIdx; i < endIdx; i++) {
+    var key = CORRIDOR_ORDER[i] + '|' + CORRIDOR_ORDER[i + 1];
+    if (CORRIDOR_LEG_MINUTES[key] == null) return null;
+    total += CORRIDOR_LEG_MINUTES[key];
+  }
+  return total;
+}
+
+// Returns arrival info for the user's chosen destination.
+// Tries Trafiklab passlist first; if that data is missing or fails sanity,
+// falls back to a corridor-leg estimate so cross-border trains still show
+// a reasonable arrival time. Returns null only if the train doesn't reach
+// the destination at all.
 function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
   if (!dep.Stops || !dep.Stops.Stop) return null;
   var stops = Array.isArray(dep.Stops.Stop) ? dep.Stops.Stop : [dep.Stops.Stop];
@@ -231,21 +282,51 @@ function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
     if (nameMatches(s.name, currentName)) { currentIdx = i; break; }
   }
   if (currentIdx < 0) currentIdx = 0;
+  var currentStop = stops[currentIdx];
+  var depTimeHere = currentStop ? (currentStop.rtDepTime || currentStop.depTime || null) : null;
 
   for (var j = currentIdx + 1; j < stops.length; j++) {
     var stop = stops[j];
     var matchedById = destId && (stop.extId === destId || stop.id === destId);
     var matchedByName = !matchedById && nameMatches(stop.name, destName);
     if (matchedById || matchedByName) {
-      if (!stop.arrTime && !stop.rtArrTime) return null;
-      return {
-        name: preferredStationName(stop.name) || stop.name,
-        time: stop.arrTime || null,
-        rtTime: stop.rtArrTime || null,
-        matchedApiName: stop.name,
-        matchedExtId: stop.extId,
-        matchedById: !!matchedById
-      };
+      var arrTime = stop.arrTime || null;
+      var rtArrTime = stop.rtArrTime || null;
+      var prefName = preferredStationName(stop.name) || stop.name || destName;
+
+      // If the API gave us a time, decide if it's sane
+      if ((arrTime || rtArrTime) && depTimeHere) {
+        var checkAgainst = rtArrTime || arrTime;
+        var journey = diffMinSrv(depTimeHere, checkAgainst);
+        if (journey > 0 && journey <= 120) {
+          return {
+            name: prefName,
+            time: arrTime,
+            rtTime: rtArrTime,
+            isEstimate: false,
+            matchedApiName: stop.name,
+            matchedExtId: stop.extId,
+            matchedById: !!matchedById
+          };
+        }
+      }
+
+      // API time missing or implausible — fall back to corridor estimate
+      if (depTimeHere) {
+        var est = estimateCorridorMinutes(currentName, destName);
+        if (est != null && est > 0) {
+          return {
+            name: prefName,
+            time: addMinutes(depTimeHere, est),
+            rtTime: null,
+            isEstimate: true,
+            matchedApiName: stop.name,
+            matchedExtId: stop.extId,
+            matchedById: !!matchedById
+          };
+        }
+      }
+      return null;
     }
   }
   return null;
@@ -264,7 +345,8 @@ function findBusArrivalAtDest(dep, destId, destName) {
   return {
     name: preferredStationName(last.name) || last.name,
     time: last.arrTime || null,
-    rtTime: last.rtArrTime || null
+    rtTime: last.rtArrTime || null,
+    isEstimate: false
   };
 }
 
@@ -414,7 +496,8 @@ app.get('/api/line-scan', async (req, res) => {
             track: d.track, cancelled: d.cancelled,
             arrTime: arr ? arr.time : null,
             rtArrTime: arr ? arr.rtTime : null,
-            arrAt: arr ? arr.name : null
+            arrAt: arr ? arr.name : null,
+            arrIsEstimate: arr ? !!arr.isEstimate : false
           };
         });
 
@@ -449,8 +532,7 @@ app.get('/api/line-scan', async (req, res) => {
             arrTime: arr ? arr.time : null,
             rtArrTime: arr ? arr.rtTime : null,
             arrAt: arr ? arr.name : null,
-            arrMatchedById: arr ? arr.matchedById : false,
-            arrMatchedApiName: arr ? arr.matchedApiName : null
+            arrIsEstimate: arr ? !!arr.isEstimate : false
           };
           if (debug) {
             out._passlist = (d._raw.Stops && d._raw.Stops.Stop)
@@ -494,7 +576,8 @@ app.get('/api/buses', async (req, res) => {
         endsAtDest: busEndsAtDestination(d.direction, destName),
         arrTime: arr ? arr.time : null,
         rtArrTime: arr ? arr.rtTime : null,
-        arrAt: arr ? arr.name : null
+        arrAt: arr ? arr.name : null,
+        arrIsEstimate: arr ? !!arr.isEstimate : false
       };
     });
     buses = buses.filter(b => b.endsAtDest && !b.isReplacement);
@@ -581,14 +664,17 @@ const HTML = `<!DOCTYPE html>
   .train-status.on-time { color: #1fd67a; }
   .train-status.delayed { color: #ffb344; }
   .train-status.cancelled { color: #ff4d4d; }
-  .train-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 80px; }
+  .train-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 84px; }
   .train-time { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1; }
   .train-time.delayed { color: #ffb344; }
   .train-time.cancelled { color: #ff4d4d; text-decoration: line-through; }
   .train-time .orig { display: block; font-size: 10px; color: #666; text-decoration: line-through; font-weight: 400; }
   .train-arrival { font-size: 11px; font-variant-numeric: tabular-nums; line-height: 1; color: #1fd67a; font-weight: 600; display: flex; align-items: center; gap: 3px; }
   .train-arrival .arrow { color: #1fd67a; font-size: 9px; }
+  .train-arrival.estimate { color: #ffb344; }
+  .train-arrival.estimate .arrow { color: #ffb344; }
   .train-arr-station { font-size: 10px; color: #1fd67a; font-weight: 500; line-height: 1.1; }
+  .train-arr-station.estimate { color: #ffb344; }
   .train-track { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600; padding: 1px 6px; border: 0.5px solid rgba(255,255,255,0.15); border-radius: 4px; }
   .scan-empty { font-size: 12px; color: #666; padding: 8px 12px; font-style: italic; }
   .scan-destination { color: #1fd67a; font-size: 13px; padding: 4px 0; }
@@ -603,7 +689,7 @@ const HTML = `<!DOCTYPE html>
   .bus-tag.toward { background: rgba(31,214,122,0.15); color: #1fd67a; border: 0.5px solid rgba(31,214,122,0.3); }
   .bus-route-line { font-size: 11px; color: #aaa; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .bus-from { color: #ffb344; font-weight: 500; }
-  .bus-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 80px; }
+  .bus-right { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; min-width: 84px; }
   .bus-time { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1; }
   .bus-time.cancelled { color: #ff4d4d; text-decoration: line-through; }
   .bus-arrival { font-size: 11px; font-variant-numeric: tabular-nums; color: #1fd67a; font-weight: 600; line-height: 1; display: flex; align-items: center; gap: 3px; }
@@ -615,6 +701,8 @@ const HTML = `<!DOCTYPE html>
   .refresh { width: 100%; background: #1a1a1d; color: #f0f0f0; border: 0.5px solid rgba(255,255,255,0.1); padding: 12px; border-radius: 12px; margin-top: 14px; cursor: pointer; font-size: 13px; font-weight: 500; }
   .refresh:hover { background: #2a2a2d; }
   .footer { text-align: center; color: #444; font-size: 10px; margin-top: 18px; letter-spacing: 0.3px; }
+  .estimate-legend { text-align: center; color: #888; font-size: 10px; margin-top: 14px; padding: 8px 12px; background: rgba(255,179,68,0.04); border: 0.5px solid rgba(255,179,68,0.15); border-radius: 8px; }
+  .estimate-legend strong { color: #ffb344; }
   .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(6px); display: none; align-items: flex-end; justify-content: center; z-index: 100; }
   .modal-bg.on { display: flex; }
   .modal { background: #1a1a1d; width: 100%; max-width: 440px; border-radius: 18px 18px 0 0; padding: 20px 16px 24px; max-height: 80vh; overflow-y: auto; border-top: 0.5px solid rgba(255,255,255,0.1); }
@@ -672,6 +760,10 @@ const HTML = `<!DOCTYPE html>
 
   <div id="bus-container"></div>
 
+  <div id="estimate-legend" class="estimate-legend" style="display:none">
+    <strong>~estimated</strong> arrivals are computed from typical corridor times when Trafiklab's data is incomplete (e.g. cross-border trains). Live Danish data arrives once the Rejseplanen API is connected.
+  </div>
+
   <button class="refresh" onclick="loadEverything()">Refresh</button>
 
   <div class="footer" id="footer">BroAlert ` + VERSION + `</div>
@@ -691,7 +783,7 @@ const HTML = `<!DOCTYPE html>
     to:   { id: '740000787', name: 'København H', country: 'DK' }
   };
   var pickerTarget = null;
-  var MAX_JOURNEY_MIN = 100;
+  var MAX_JOURNEY_MIN = 120;
   var MAX_DELAY_VS_SCHEDULED = 60;
 
   try {
@@ -779,9 +871,6 @@ const HTML = `<!DOCTYPE html>
     return '<div class="train-track">Spår ' + escapeHtml(track) + '</div>';
   }
 
-  // Choose the most trustworthy arrival time:
-  // - If only one is present, use it.
-  // - If both exist but real-time is >60 min off scheduled, trust scheduled (real-time looks corrupted).
   function chooseTrustedArrTime(arrTime, rtArrTime) {
     if (!arrTime && !rtArrTime) return null;
     if (!arrTime) return rtArrTime;
@@ -791,15 +880,21 @@ const HTML = `<!DOCTYPE html>
     return rtArrTime;
   }
 
-  function destArrivalBlock(arrTime, rtArrTime, cancelled, depTime, arrAt) {
+  // Tracks whether any estimate appeared in the rendered set (used to show legend)
+  var sawAnyEstimate = false;
+
+  function destArrivalBlock(arrTime, rtArrTime, cancelled, depTime, arrAt, isEstimate) {
     if (cancelled || !arrAt) return '';
-    var chosen = chooseTrustedArrTime(arrTime, rtArrTime);
+    var chosen = isEstimate ? arrTime : chooseTrustedArrTime(arrTime, rtArrTime);
     if (!chosen || !depTime) return '';
     var journey = diffMin(fmtTime(depTime), fmtTime(chosen));
     if (journey <= 0 || journey > MAX_JOURNEY_MIN) return '';
     var arr = fmtTime(chosen);
-    return '<div class="train-arrival"><span class="arrow">→</span>' + arr + '</div>' +
-           '<div class="train-arr-station">' + escapeHtml(arrAt) + '</div>';
+    var cls = isEstimate ? ' estimate' : '';
+    var prefix = isEstimate ? '~' : '';
+    if (isEstimate) sawAnyEstimate = true;
+    return '<div class="train-arrival' + cls + '"><span class="arrow">→</span>' + prefix + arr + '</div>' +
+           '<div class="train-arr-station' + cls + '">' + escapeHtml(arrAt) + (isEstimate ? ' (est)' : '') + '</div>';
   }
 
   function renderTrainRow(train) {
@@ -828,13 +923,14 @@ const HTML = `<!DOCTYPE html>
              '</div>' +
              '<div class="train-right">' +
                '<div class="train-time ' + timeClass + '">' + timeHtml + '</div>' +
-               destArrivalBlock(train.arrTime, train.rtArrTime, cancelled, train.time, train.arrAt) +
+               destArrivalBlock(train.arrTime, train.rtArrTime, cancelled, train.time, train.arrAt, train.arrIsEstimate) +
                trackBadge(train.track) +
              '</div>' +
            '</div>';
   }
 
   function renderLineScan(data) {
+    sawAnyEstimate = false;
     var container = document.getElementById('scan-container');
     if (!data.supported) {
       container.innerHTML = '<div class="err-box">Route between these stations is outside the supported Øresund corridor for now.</div>';
@@ -907,6 +1003,9 @@ const HTML = `<!DOCTYPE html>
     }
     html += '</div>';
     container.innerHTML = html;
+    // Show estimate legend only if any estimate appeared
+    var legend = document.getElementById('estimate-legend');
+    legend.style.display = sawAnyEstimate ? 'block' : 'none';
     return {
       totalStop: totalStop, anyIssue: anyIssue, totalTrains: totalTrains,
       firstWorkingIdx: firstWorkingIdx, originOK: originOK, stations: stations,
@@ -933,7 +1032,6 @@ const HTML = `<!DOCTYPE html>
     }
     label.style.display = 'flex';
     var html = '';
-
     if (replacements.length > 0) {
       html += '<div class="bus-section"><div class="bus-section-head">Replacement buses (Tåg-bussar)</div>';
       replacements.sort(function(a, b) { return (a.time || '').localeCompare(b.time || ''); });
@@ -958,7 +1056,6 @@ const HTML = `<!DOCTYPE html>
       }
       html += '</div>';
     }
-
     if (directToDest.length > 0) {
       html += '<div class="bus-section"><div class="bus-section-head">Direct buses to ' + escapeHtml(state.to.name) + '</div>';
       directToDest.sort(function(a, b) { return (a.time || '').localeCompare(b.time || ''); });
@@ -983,7 +1080,6 @@ const HTML = `<!DOCTYPE html>
       }
       html += '</div>';
     }
-
     container.innerHTML = html;
   }
 

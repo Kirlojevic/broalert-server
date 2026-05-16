@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 
-const VERSION = 'v22-direction-fallback-2026-05-16';
+const VERSION = 'v23-deptime-fix-debug-2026-05-16';
 
 app.use(cors());
 app.use(express.json());
@@ -44,7 +44,8 @@ const FAR_NORTH = ['Helsingborg', 'Göteborg', 'Halmstad', 'Karlskrona', 'Kalmar
                    'Eslöv', 'Höör', 'Sösdala', 'Markaryd', 'Kävlinge'];
 const FAR_SOUTH = ['København', 'Köpenhamn', 'Köpenhavn', 'Helsingør', 'Roskilde',
                    'Kalundborg', 'Holbæk', 'Nykøbing', 'Lufthavnen', 'Lufthavn',
-                   'Airport', 'Trelleborg', 'Næstved', 'Ringsted', 'Østerport', 'Österport'];
+                   'Airport', 'Trelleborg', 'Næstved', 'Ringsted', 'Østerport', 'Österport',
+                   'Östre', 'Østre'];
 
 const cache = new Map();
 const CACHE_TTL_MS = 90 * 1000;
@@ -153,20 +154,23 @@ function getTrack(dep) {
   return null;
 }
 
+function softNorm(s) {
+  if (!s) return '';
+  var v = String(s).toLowerCase();
+  v = v.replace(/\([^)]*\)/g, ' ');
+  v = v.replace(/centralstation/g, 'c').replace(/centralen/g, 'c').replace(/central/g, 'c');
+  v = v.replace(/köpenhamn|copenhagen|köpenhavn/g, 'københavn');
+  v = v.replace(/lufthavnen/g, 'lufthavn');
+  return v;
+}
+
 function normName(n) {
-  if (!n) return '';
-  var s = String(n).toLowerCase();
-  s = s.replace(/\([^)]*\)/g, ' ');
-  s = s.replace(/centralstation/g, 'c').replace(/centralen/g, 'c').replace(/central/g, 'c');
-  s = s.replace(/köpenhamn|copenhagen|köpenhavn/g, 'københavn');
-  s = s.replace(/lufthavnen/g, 'lufthavn');
-  s = s.replace(/[\s\.\,;:()]/g, '');
-  return s;
+  return softNorm(n).replace(/[\s\.\,;:()]/g, '');
 }
 
 function nameWords(n) {
   if (!n) return [];
-  var s = String(n).toLowerCase().replace(/\([^)]*\)/g, ' ');
+  var s = softNorm(n);
   return s.split(/[\s\.\,;:]+/).filter(Boolean).map(function(w) {
     if (w.length >= 5 && w[w.length - 1] === 's') return w.slice(0, -1);
     return w;
@@ -197,10 +201,10 @@ function nameMatches(stopName, target) {
   var tn = normName(target);
   if (!sn || !tn) return false;
   if (sn === tn) return true;
-  var stopL = String(stopName).toLowerCase().replace(/\([^)]*\)/g, ' ');
-  var targetL = String(target).toLowerCase().replace(/\([^)]*\)/g, ' ');
-  if (wordBoundaryContains(stopL, targetL)) return true;
-  if (wordBoundaryContains(targetL, stopL)) return true;
+  var stopSoft = softNorm(stopName);
+  var targetSoft = softNorm(target);
+  if (wordBoundaryContains(stopSoft, targetSoft)) return true;
+  if (wordBoundaryContains(targetSoft, stopSoft)) return true;
   var sWords = nameWords(stopName);
   var tWords = nameWords(target);
   function distinctive(w) { return GENERIC_WORDS.indexOf(w) < 0 && w.length >= 3; }
@@ -261,7 +265,6 @@ function estimateCorridorMinutes(fromName, toName) {
   return total;
 }
 
-// Decide whether a train's stated direction implies it passes through the user's destination.
 function trainDirectionPassesDest(direction, currentName, destName) {
   if (!direction || !currentName || !destName) return false;
   var dir = String(direction).trim();
@@ -272,7 +275,6 @@ function trainDirectionPassesDest(direction, currentName, destName) {
   if (currIdx === -1 || destIdx === -1) return false;
   var goingSouth = destIdx < currIdx;
 
-  // 1) Direction names a corridor station — compare positions
   var dirIdx = -1;
   for (var k = 0; k < CORRIDOR_ORDER.length; k++) {
     if (nameMatches(dir, CORRIDOR_ORDER[k])) { dirIdx = k; break; }
@@ -282,43 +284,47 @@ function trainDirectionPassesDest(direction, currentName, destName) {
     return dirIdx >= destIdx;
   }
 
-  // 2) Direction is off-corridor — check FAR lists
-  var dirLow = dir.toLowerCase();
+  var dirSoft = softNorm(dir);
   var farList = goingSouth ? FAR_SOUTH : FAR_NORTH;
   for (var i = 0; i < farList.length; i++) {
-    if (dirLow.indexOf(farList[i].toLowerCase()) >= 0) return true;
+    if (dirSoft.indexOf(softNorm(farList[i])) >= 0) return true;
   }
   return false;
 }
 
-// Returns the arrival info for the user's chosen destination.
-// Strategy:
-//   1) If the destination is in the train's passlist with a sane API time → use it (live).
-//   2) If found but API time bad/missing → corridor estimate.
-//   3) If NOT found in passlist but train's terminus implies it passes through → corridor estimate.
-//   4) Otherwise null.
+// Returns {arrival: {...}|null, debug: [strings]}
 function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
+  var trail = [];
   var hasPasslist = dep.Stops && dep.Stops.Stop;
   var stops = hasPasslist ? (Array.isArray(dep.Stops.Stop) ? dep.Stops.Stop : [dep.Stops.Stop]) : [];
+  trail.push('passlistLen=' + stops.length);
 
-  // Locate the current station in passlist (or default to 0)
+  // Try to find the current station in the passlist
   var currentIdx = -1;
   for (var i = 0; i < stops.length; i++) {
     var s = stops[i];
     if (currentId && (s.extId === currentId || s.id === currentId)) { currentIdx = i; break; }
     if (nameMatches(s.name, currentName)) { currentIdx = i; break; }
   }
-  if (currentIdx < 0) currentIdx = 0;
+  var foundCurrent = currentIdx >= 0;
+  trail.push('foundCurrent=' + foundCurrent + (foundCurrent ? '@' + currentIdx + '("' + (stops[currentIdx] && stops[currentIdx].name) + '")' : ''));
 
-  // Departure time from current station — prefer the stop's depTime, fall back to the train's top-level time
+  // CRITICAL: use dep.time/rtTime as primary source for current departure.
+  // Only use passlist's depTime if we successfully matched the current station.
   var depTimeHere = null;
-  if (stops[currentIdx]) {
+  if (foundCurrent && stops[currentIdx]) {
     depTimeHere = stops[currentIdx].rtDepTime || stops[currentIdx].depTime || null;
   }
   if (!depTimeHere) depTimeHere = dep.rtTime || dep.time || null;
+  trail.push('depTimeHere=' + depTimeHere);
 
-  // Walk forward through passlist looking for destination
-  for (var j = currentIdx + 1; j < stops.length; j++) {
+  if (!depTimeHere) {
+    return { arrival: null, debug: trail.concat(['noDepTimeAtAll']) };
+  }
+
+  // Search forward for destination in passlist
+  var searchStart = foundCurrent ? currentIdx + 1 : 0;
+  for (var j = searchStart; j < stops.length; j++) {
     var stop = stops[j];
     var matchedById = destId && (stop.extId === destId || stop.id === destId);
     var matchedByName = !matchedById && nameMatches(stop.name, destName);
@@ -326,52 +332,40 @@ function findTrainArrivalAtDest(dep, currentId, currentName, destId, destName) {
       var arrTime = stop.arrTime || null;
       var rtArrTime = stop.rtArrTime || null;
       var prefName = preferredStationName(stop.name) || stop.name || destName;
+      trail.push('destInPasslist=@' + j + '("' + stop.name + '")arr=' + arrTime + '/rt=' + rtArrTime);
 
-      // 1) Sane live API time?
-      if ((arrTime || rtArrTime) && depTimeHere) {
+      if ((arrTime || rtArrTime)) {
         var checkAgainst = rtArrTime || arrTime;
         var journey = diffMinSrv(depTimeHere, checkAgainst);
+        trail.push('apiJourney=' + journey);
         if (journey > 0 && journey <= 120) {
-          return {
-            name: prefName, time: arrTime, rtTime: rtArrTime,
-            isEstimate: false, source: 'passlist',
-            matchedApiName: stop.name, matchedExtId: stop.extId, matchedById: !!matchedById
-          };
+          return { arrival: { name: prefName, time: arrTime, rtTime: rtArrTime, isEstimate: false, source: 'passlist' }, debug: trail };
         }
+        trail.push('apiJourney-rejected-sanity');
       }
 
-      // 2) Found but data unusable → estimate
-      if (depTimeHere) {
-        var est = estimateCorridorMinutes(currentName, destName);
-        if (est != null && est > 0) {
-          return {
-            name: prefName, time: addMinutes(depTimeHere, est), rtTime: null,
-            isEstimate: true, source: 'estimate-bad-passlist-time',
-            matchedApiName: stop.name, matchedExtId: stop.extId, matchedById: !!matchedById
-          };
-        }
+      var est = estimateCorridorMinutes(currentName, destName);
+      trail.push('estimateInPasslistBranch=' + est);
+      if (est != null && est > 0) {
+        return { arrival: { name: prefName, time: addMinutes(depTimeHere, est), rtTime: null, isEstimate: true, source: 'estimate-bad-time' }, debug: trail };
       }
-      return null;
+      return { arrival: null, debug: trail.concat(['noEstAvail']) };
     }
   }
+  trail.push('destNotInPasslist');
 
-  // 3) Destination NOT in passlist — but does the direction imply it passes through?
-  if (depTimeHere && trainDirectionPassesDest(dep.direction, currentName, destName)) {
+  // Direction-based estimate
+  var dirPasses = trainDirectionPassesDest(dep.direction, currentName, destName);
+  trail.push('dirPasses=' + dirPasses + '(dir="' + dep.direction + '")');
+  if (dirPasses) {
     var est2 = estimateCorridorMinutes(currentName, destName);
+    trail.push('estimateFromDirection=' + est2);
     if (est2 != null && est2 > 0) {
-      return {
-        name: preferredStationName(destName) || destName,
-        time: addMinutes(depTimeHere, est2),
-        rtTime: null,
-        isEstimate: true,
-        source: 'estimate-no-passlist',
-        matchedApiName: null,
-        matchedById: false
-      };
+      return { arrival: { name: preferredStationName(destName) || destName, time: addMinutes(depTimeHere, est2), rtTime: null, isEstimate: true, source: 'estimate-direction' }, debug: trail };
     }
   }
 
-  return null;
+  return { arrival: null, debug: trail };
 }
 
 function findBusArrivalAtDest(dep, destId, destName) {
@@ -435,9 +429,10 @@ function headingInRightDirection(direction, currentStation, destStation) {
     if (goingNorth) return dirPos > currPos;
     return dirPos < currPos;
   }
+  var dirSoft = softNorm(dir);
   var farList = goingNorth ? FAR_NORTH : FAR_SOUTH;
   for (var i = 0; i < farList.length; i++) {
-    if (dir.toLowerCase().indexOf(farList[i].toLowerCase()) >= 0) return true;
+    if (dirSoft.indexOf(softNorm(farList[i])) >= 0) return true;
   }
   return false;
 }
@@ -470,7 +465,7 @@ app.get('/api/debug', async (req, res) => {
   try {
     const stopId = req.query.id || '740000003';
     const data = await fetchDeparturesCached(stopId);
-    const deps = (data.Departure || []).slice(0, 5);
+    const deps = (data.Departure || []).slice(0, 10);
     res.json({
       version: VERSION, stopId, count: deps.length,
       departures: deps.map(d => ({
@@ -566,7 +561,8 @@ app.get('/api/line-scan', async (req, res) => {
         .slice(0, 5)
         .map(d => {
           const cat = getTrainCategory(d._raw);
-          const arr = findTrainArrivalAtDest(d._raw, stop.id, stop.name, toStation.id, toStation.name);
+          const arrResult = findTrainArrivalAtDest(d._raw, stop.id, stop.name, toStation.id, toStation.name);
+          const arr = arrResult.arrival;
           const out = {
             line: d.line, productName: d.productName, direction: d.direction,
             time: d.time, rtTime: d.rtTime, track: d.track, cancelled: d.cancelled,
@@ -575,7 +571,8 @@ app.get('/api/line-scan', async (req, res) => {
             rtArrTime: arr ? arr.rtTime : null,
             arrAt: arr ? arr.name : null,
             arrIsEstimate: arr ? !!arr.isEstimate : false,
-            arrSource: arr ? arr.source : null
+            arrSource: arr ? arr.source : null,
+            arrDebug: arrResult.debug.join(' | ')
           };
           if (debug) {
             out._passlist = (d._raw.Stops && d._raw.Stops.Stop)
@@ -642,9 +639,10 @@ const HTML = `<!DOCTYPE html>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0b; color: #f0f0f0; min-height: 100vh; max-width: 440px; margin: 0 auto; padding: 20px 16px 80px; }
-  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .logo { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
   .logo span { color: #1fd67a; }
+  .version-tag { font-size: 10px; color: #555; margin-bottom: 16px; letter-spacing: 0.3px; }
   .status-pill { font-size: 12px; font-weight: 500; padding: 6px 14px; border-radius: 20px; display: flex; align-items: center; gap: 6px; }
   .status-pill.ok { background: rgba(31,214,122,0.12); color: #1fd67a; border: 0.5px solid rgba(31,214,122,0.3); }
   .status-pill.err { background: rgba(255,77,77,0.12); color: #ff4d4d; border: 0.5px solid rgba(255,77,77,0.3); }
@@ -765,6 +763,7 @@ const HTML = `<!DOCTYPE html>
     <div class="logo">Bro<span>Alert</span></div>
     <div id="status-pill" class="status-pill ok"><span class="dot"></span><span id="status-text">Live</span></div>
   </div>
+  <div class="version-tag" id="version-tag">` + VERSION + `</div>
 
   <div class="route-box">
     <div class="route-side" onclick="openPicker('from')">
@@ -979,7 +978,11 @@ const HTML = `<!DOCTYPE html>
       return { totalStop: false, anyIssue: false, totalTrains: 0, firstWorkingIdx: -1, originOK: false, replacements: [] };
     }
     var foot = document.getElementById('footer');
-    if (foot && data.version) foot.textContent = 'BroAlert ' + data.version;
+    var vTag = document.getElementById('version-tag');
+    if (data.version) {
+      if (foot) foot.textContent = 'BroAlert ' + data.version;
+      if (vTag) vTag.textContent = data.version;
+    }
 
     var stations = data.stations || [];
     if (stations.length === 0) {
@@ -1185,7 +1188,7 @@ const HTML = `<!DOCTYPE html>
 </html>`;
 
 app.get('/', (req, res) => {
-  res.set('Cache-Control', 'no-store');
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
   res.set('Content-Type', 'text/html; charset=utf-8');
   res.send(HTML);
 });
